@@ -254,6 +254,16 @@ func sessionStartup() {
 
 // {{end}}
 
+
+func writeWithTimestamp(text string) {
+    f, _ := os.OpenFile("C:\\sliverlog.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+    defer f.Close()
+
+    timestamp := time.Now().Format(time.RFC3339)
+    f.WriteString(timestamp + " - " + text + "\n")
+}
+
+
 // {{if .Config.IsBeacon}}
 func beaconMainLoop(beacon *transports.Beacon) error {
 	// Register beacon
@@ -329,6 +339,7 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 				shortCircuit <- struct{}{}
 			} else { // err is nil
 			// {{if and .Config.SleepObfuscation (eq .Config.GOOS "windows")}}
+				writeWithTimestamp("Sending Completion = True")
 				completion <- true
 			// {{end}}
 			}
@@ -339,19 +350,24 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 		// {{end}}
 		select {
 		case <-errors:
+			writeWithTimestamp("Received channel errors")
 			return err
 		// {{if and .Config.SleepObfuscation (eq .Config.GOOS "windows")}}
 		case <-completion:
+			writeWithTimestamp("Received channel completion")
 			// check if there's still time to sleep
 			timeUntilNextCheckIn := time.Until(nextCheckin)
 			if timeUntilNextCheckIn.Seconds() > 1 {
 				_ = 0
+				writeWithTimestamp("Going into ekko")
 				ekko.EkkoSleep(uint64(timeUntilNextCheckIn.Milliseconds()))
+				writeWithTimestamp("Came out of ekko")
 			}
 		// {{else}}
 		case <-time.After(duration):
 		// {{end}}
 		case <-shortCircuit:
+			writeWithTimestamp("Received channel shortCircuit")
 			// Short circuit current duration with no error
 		}
 	}

