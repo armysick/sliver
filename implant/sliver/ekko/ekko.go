@@ -55,6 +55,22 @@ func writeWithTimestamp(value interface{}) {
 }
 
 
+func reverseArray(arr []uint32) []uint32 {
+    start := 0
+    end := len(arr) - 1
+
+    for start < end {
+        // Swap the elements
+        arr[start], arr[end] = arr[end], arr[start]
+        start++
+        end--
+    }
+
+    return arr
+}
+
+
+
 func EkkoSleep(sleepTime uint64) error {
 
 	currentProcessID := uint32(windows.GetCurrentProcessId())
@@ -98,9 +114,10 @@ func EkkoSleep(sleepTime uint64) error {
 				ImageEndAddress := ImageBase + uintptr(nt_header.OptionalHeader.SizeOfImage)
 
 				if dwStartAddress >= ImageBase && dwStartAddress <= ImageEndAddress {
-					procSuspendThread.Call(uintptr(hThread))
-					writeWithTimestamp("Suspended Thread: ")
+					writeWithTimestamp("Suspending...")
 					writeWithTimestamp(te32.ThreadID)
+					procSuspendThread.Call(uintptr(hThread))
+					writeWithTimestamp("Suspended Successfully")
 					suspendedThreadIDs = append(suspendedThreadIDs,te32.ThreadID)
 				} else {
 					goto nextThread
@@ -116,6 +133,8 @@ func EkkoSleep(sleepTime uint64) error {
 			break // No more threads
 		}
 	}
+
+	suspendedThreadIDs = reverseArray(suspendedThreadIDs)
 
 	writeWithTimestamp("Threads suspended")
 	te32.Size = uint32(unsafe.Sizeof(te32))
