@@ -3,6 +3,7 @@ package ekko
 import (
 	"crypto/rand"
 	"log"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -49,7 +50,18 @@ var (
 
 func EkkoSleep(sleepTime uint64) error {
 
+	// Pin the goroutine to the current OS thread for the entire duration of
+	// the sleep. Without this, the Go scheduler can migrate the goroutine to
+	// a different M between iterations of the suspend loop, causing
+	// GetCurrentThreadId() to return a stale TID and — on the next iteration
+	// — we call SuspendThread on the very thread we are currently running on.
+	// That is exactly the hang scenario we saw in Process Hacker: one thread
+	// suspended, stack frozen inside NtSuspendThread, inside EkkoSleep.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	currentProcessID := uint32(windows.GetCurrentProcessId())
+	currentTID := windows.GetCurrentThreadId()
 
 	// Take a snapshot of all running threads in the system
 	hThreadSnapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
@@ -78,7 +90,7 @@ func EkkoSleep(sleepTime uint64) error {
 	ImageEndAddress := ImageBase + uintptr(nt_header.OptionalHeader.SizeOfImage)
 
 	for {
-		if te32.OwnerProcessID == currentProcessID && windows.GetCurrentThreadId() != te32.ThreadID {
+		if te32.OwnerProcessID == currentProcessID && te32.ThreadID != currentTID {
 			hThread, openErr := windows.OpenThread(threadAccess, false, te32.ThreadID)
 			if openErr == nil {
 				var dwStartAddress, size uintptr
