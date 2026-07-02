@@ -139,6 +139,18 @@ timer fires and forcibly resumes every image-based thread. This
 converts a permanent hang into a "beacon skips one cycle and
 self-recovers" event. **This is the option we're implementing.**
 
+  Important pitfall: the callback CANNOT be a `syscall.NewCallback`
+  Go function, because Go's callback dispatch path
+  (`cgocallback → needm → acquirep`) needs a P to run the callback's
+  Go code — and if every Go M is suspended, no Ps are available. The
+  callback deadlocks in the exact same way as the caller. **The
+  callback must be a raw Windows API function pointer** (e.g.
+  `procResumeThread.Addr()`), passed to `CreateTimerQueueTimer` with
+  a Windows HANDLE as `lpParameter`. Windows will then call
+  `ResumeThread(hThread)` directly with zero Go involvement.
+  Implementation uses one one-shot timer per suspended peer thread;
+  each timer's parameter is that peer's handle.
+
 **2. Reduce per-cycle syscall count.** Fewer syscalls = fewer chances
 to lose the race. Cache peer TID lists across cycles. Drop workarounds
 that solve non-problems (self-heal). Skip debug probes in production.

