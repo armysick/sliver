@@ -232,3 +232,202 @@ encryption:
 Cobalt Strike / Havoc / other C-beacon Ekko implementations don't hit
 this because C programs don't have a scheduler. Go does. Everything
 downstream flows from that.
+
+
+HUMAN NOTE:
+"TID 6176 spinning is the villain. It's a Go M we just resumed (first in the resume list). Freshly running, holding a P, apparently in a tight loop somewhere in the Go runtime (probably scheduler-related since sysmon is one of the suspended peers and can't preempt anything). Our next ResumeThread call can't get its P back — deadlock."
+
+
+## The watchdog design in one page
+
+A walkthrough of `apc.Sleep`, in reading order, showing where each
+rescue mechanism plugs in.
+
+### The pieces, in `apc.go`
+
+1. **Constants** (in the `const (...)` block near the top):
+   - `watchdogMarginMinMs = 5000` / `watchdogMarginMaxMs = 15000` —
+     floor/cap on the suspend-phase timeout. The actual timeout is
+     `sleepMs + clamp(sleepMs, 5s..15s)` so short-interval beacons
+     recover fast and long-interval beacons don't wait forever.
+   - `resumeWatchdogMs = 8000` — fixed timeout for the resume-phase
+     timers.
+   - `wtExecuteOnlyOnce = 0x00000008` — Windows flag telling the
+     timer to fire once and self-delete.
+
+2. **The proc pointers** (in the `var (...)` block):
+   - `procCreateTimerQueueTimer` — register a Windows thread-pool
+     timer.
+   - `procDeleteTimerQueueTimer` — cancel one.
+   - `procResumeThread` — used as the *callback target itself* on
+     the rescue path, not as something we call directly.
+
+3. **`peerState` struct** — one row per suspended peer, carrying
+   its TID, an open handle, and a timer handle.
+
+4. **`watchdogTimeoutMs(sleepMs)`** — the proportional-margin
+   formula.
+
+5. **`suspendAndArmPeers()` — where the *suspend-phase* watchdogs
+   get armed.** Look for:
+
+   ```go
+   // Arm the watchdog BEFORE the SuspendThread that
+   // might deadlock us.
+   var hTimer uintptr
+   wdRet, _, _ := procCreateTimerQueueTimer.Call(
+       uintptr(unsafe.Pointer(&hTimer)),
+       0,                            // default timer queue
+       procResumeThread.Addr(),      // <-- KEY LINE: raw API pointer
+       uintptr(hThread),             // arg passed to ResumeThread
+       uintptr(wdTimeoutMs),         // deadline
+       0,                            // period (0 = one-shot)
+       wtExecuteOnlyOnce,
+   )
+   r, _, _ := procSuspendThread.Call(uintptr(hThread))
+   ```
+
+   The critical thing: the timer's *callback* is
+   `procResumeThread.Addr()` itself. When the timer fires, Windows
+   calls `ResumeThread(hThread)` directly — no Go code involved.
+   That's what makes the rescue work when Go's runtime is
+   deadlocked.
+
+6. **`cancelWatchdogs(peers)`** — right after the suspend loop
+   returns, cancels all suspend-phase watchdogs so they can't fire
+   during encryption. Passes `INVALID_HANDLE_VALUE` as
+   `CompletionEvent`, which makes `DeleteTimerQueueTimer` block
+   until any callback that's mid-flight finishes.
+
+7. **`verifyAllPeersSuspended(peers)`** — queries
+   `NtQueryInformationThread` with class `ThreadSuspendCount`
+   (`0x23`) for each peer. Returns `false` if any peer's count is 0,
+   meaning its watchdog fired and un-suspended it. This is the
+   "abort encryption" check.
+
+8. **`armResumeWatchdogs(peers)` — the *resume-phase* watchdogs.**
+   Same shape as the arming inside `suspendAndArmPeers`, called
+   just before `resumeAndClose`:
+
+   ```go
+   armResumeWatchdogs(peers)
+   resumeAndClose(cycle, peers)
+   ```
+
+9. **`resumeAndClose()`** — for each peer: cancel its timer
+   (blocking wait for in-flight callback), drain-resume, close
+   handle. Same order for suspend-phase timers (already cancelled
+   by `cancelWatchdogs` earlier, so cheap no-op) and for
+   resume-phase timers (the important ones).
+
+10. **The rescue-detection log line** at the end of `Sleep()`:
+
+    ```go
+    elapsedMs := uint64(time.Since(sleepStart).Milliseconds())
+    if elapsedMs > sleepMs+watchdogMarginMinMs {
+        dbg("cycle=%d WATCHDOG likely RESCUED (elapsedMs=%d intendedMs=%d)",
+            cycle, elapsedMs, sleepMs)
+    }
+    ```
+
+### The overall flow, once through `Sleep`
+
+1. `LockOSThread` + logging + setup.
+2. `suspendAndArmPeers` — enters iteration; for each peer, **arms
+   suspend-phase watchdog, then `SuspendThread`**. If any Suspend
+   deadlocks, its own peer's watchdog fires and un-suspends it,
+   breaking the deadlock.
+3. `cancelWatchdogs` — kill all suspend-phase timers before we
+   enter the encrypted window.
+4. `verifyAllPeersSuspended` — did any watchdog fire during step
+   2? If yes, some peer is running; abort encryption (safe-abort
+   path also arms resume-phase watchdogs before its resume).
+5. `NtDelayExecution` commit delay.
+6. `QueueUserAPC` + alertable wait — the encrypt/sleep/decrypt
+   trampoline runs.
+7. `armResumeWatchdogs` — arms resume-phase timers before the
+   vulnerable resume loop.
+8. `resumeAndClose` — for each peer: cancel its resume-phase
+   timer, drain-resume, close. If the resume loop deadlocks,
+   resume-phase timers fire and un-suspend other peers, freeing a
+   P and breaking the deadlock.
+9. Rescue detection via elapsed-time comparison.
+
+### The key insight, in one sentence
+
+**The rescue mechanism works precisely because Windows timer
+callbacks execute on thread-pool workers whose start address lives
+in `ntdll` — not in our image — so our own peer-suspension filter
+always excludes them, and they can always run even when every Go M
+is frozen.** That, combined with the callback being a raw Windows
+API pointer (not a Go callback that would need a P to dispatch), is
+what makes the whole design possible.
+
+
+## TODO — future work
+
+### 1. Test APC without leaving `.text` as RWX
+
+The current trampoline restores the image's protection to
+`PAGE_EXECUTE_READWRITE` (0x40) at the end of every cycle. This
+matches upstream Ekko and is the *simplest* thing that works — a
+single VirtualProtect over the whole `SizeOfImage` region — but RWX
+memory is a loud IOC. Memory scanners (Defender AMSI callbacks,
+Elastic, Sysmon, PE-sieve, moneta, HollowsHunter…) flag it
+immediately.
+
+The right thing is to restore each section to its original
+protection: `.text` → `PAGE_EXECUTE_READ` (RX), `.rdata` →
+`PAGE_READONLY`, `.data` → `PAGE_READWRITE`. That means:
+
+- At package init or first-Sleep, walk the section headers, capture
+  each section's `(VirtualAddress, VirtualSize, Characteristics)`.
+- Encrypt path: `VirtualProtect` each section to `PAGE_READWRITE`
+  (or `PAGE_EXECUTE_READWRITE` if we want to be lazy on `.text`).
+- Decrypt path: `VirtualProtect` each section back to its *original*
+  protection derived from `Characteristics` bits (`IMAGE_SCN_MEM_READ`
+  / `_WRITE` / `_EXECUTE`).
+
+Complication: the current trampoline is a single hand-encoded x64
+blob with hard-coded offsets into `apcArgs`. Iterating over N
+sections means the trampoline needs a loop, or we unroll it into N
+`VirtualProtect` calls per phase — either grows the machine code
+substantially. Probably cleaner to precompute a small array of
+`{addr, size, encProt, decProt}` tuples in Go and have the
+trampoline iterate it in a tight ASM loop.
+
+Verification: after landing this, run `moneta -pid <beacon>` while
+the beacon is idle. Should show `.text` as `RX`, no `RWX` regions
+inside the image mapping. The RWX region for the trampoline itself
+will still show up but it's a fixed 96 bytes outside the image and
+much less signature-worthy.
+
+### 2. Backport the watchdog to the Ekko branch — YOLO
+
+We deferred Ekko as unsalvageable, but the watchdog design is
+orthogonal to the encryption mechanism. The P-handoff race — which
+is the *only* thing the watchdog fixes — exists identically in Ekko:
+same peer-suspend loop, same LazyProc.Call syscall churn, same
+sysmon-and-M-hold-our-P deadlock.
+
+Concretely, port to `claude_ekko`:
+- `suspendAndArmPeers` (inline arm-before-Suspend).
+- `cancelWatchdogs` + `verifyAllPeersSuspended` before Ekko's
+  timer-queue kicks off.
+- `armResumeWatchdogs` before Ekko's resume loop.
+- Same rescue-detection log line.
+
+Prediction: **this will improve Ekko's stability but won't fully
+fix it**, because Ekko's other failure modes (NtContinue-hijacked
+thread-pool worker corrupting its stack, `RtlCaptureContext`
+priming-wait timing out) are independent of the P-handoff race and
+aren't in the watchdog's coverage.
+
+But if it turns 5-minute hangs into 30-minute hangs, that's still
+interesting data — it tells us how much of Ekko's failure surface
+is P-handoff vs how much is ROP-chain-specific. And if by some
+miracle Ekko becomes usable with the watchdog, we have a second
+option for hosts where APC misbehaves.
+
+Belt-and-braces value only; not on the critical path for shipping
+APC.
