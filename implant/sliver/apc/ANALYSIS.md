@@ -161,6 +161,31 @@ self-recovers" event. **This is the option we're implementing.**
   CreateTimerQueueTimer → SuspendThread. Now the first Suspend that
   could deadlock already has its rescue timer ticking.
 
+  Third pitfall (also found in resc_att2 via manual experimentation):
+  when the watchdog fires and resumes a peer, that peer is running
+  again. Proceeding to the encryption phase (which strips `.text` of
+  its execute bit) while any peer is running WILL crash the process
+  the moment that peer fetches its next instruction from `.text`.
+  Manually resuming stuck peers via Process Hacker demonstrated the
+  exact pattern: beacon unwedged, ran for a few seconds while more
+  peers were suspended, then crashed once encryption started with a
+  running peer that shouldn't have been.
+
+  So the watchdog is only safe if we DETECT its firing and abort
+  the encryption cycle. Implementation:
+    1. After the suspend loop, cancelWatchdogs(peers) — waits for any
+       in-flight callback so peer suspend counts are stable.
+    2. verifyAllPeersSuspended(peers): NtQueryInformationThread(
+       ThreadSuspendCount) on each. If any returns 0, a watchdog fired.
+    3. If any peer isn't suspended → drain-resume everyone and return
+       without encrypting. Beacon loses one cycle of memory
+       obfuscation but survives.
+    4. Otherwise → proceed to encryption normally.
+
+  This makes the watchdog behave as a safety net that trades one
+  obfuscation cycle for stability, rather than trading a permanent
+  hang for a delayed crash.
+
 **2. Reduce per-cycle syscall count.** Fewer syscalls = fewer chances
 to lose the race. Cache peer TID lists across cycles. Drop workarounds
 that solve non-problems (self-heal). Skip debug probes in production.
