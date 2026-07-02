@@ -151,6 +151,16 @@ self-recovers" event. **This is the option we're implementing.**
   Implementation uses one one-shot timer per suspended peer thread;
   each timer's parameter is that peer's handle.
 
+  Second pitfall (found in resc_att2): the watchdog must be armed
+  BEFORE each SuspendThread, not after the whole suspend loop.
+  The P-handoff deadlock is triggered by the very SuspendThread that
+  captures the M holding our P, and it manifests in the exitsyscall
+  frame of that call — so if we arm the watchdog only after the loop
+  completes, the loop never completes and no timer is ever registered.
+  The correct order is interleaved: per peer, OpenThread →
+  CreateTimerQueueTimer → SuspendThread. Now the first Suspend that
+  could deadlock already has its rescue timer ticking.
+
 **2. Reduce per-cycle syscall count.** Fewer syscalls = fewer chances
 to lose the race. Cache peer TID lists across cycles. Drop workarounds
 that solve non-problems (self-heal). Skip debug probes in production.

