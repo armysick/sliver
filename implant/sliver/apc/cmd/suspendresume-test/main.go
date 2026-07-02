@@ -69,6 +69,7 @@ var (
 	procOutputDebugStringA       = kernel32.NewProc("OutputDebugStringA")
 	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
 	procNtQueryInformationThread = ntdll.NewProc("NtQueryInformationThread")
+	procNtDelayExecution         = ntdll.NewProc("NtDelayExecution")
 
 	logFile    *os.File
 	logMu      sync.Mutex
@@ -275,7 +276,19 @@ func main() {
 		logf("cycle=%d suspended=%d/%d", cycle, len(suspended), len(peers))
 
 		// Hold suspended for the beacon-like duration.
-		time.Sleep(sleepDurationMs * time.Millisecond)
+		//
+		// CRITICAL: we MUST NOT use time.Sleep here. time.Sleep parks
+		// the goroutine on Go's runtime timer subsystem, which requires
+		// OTHER Go Ms to be running to fire the wakeup. We just
+		// suspended all of them, so time.Sleep would deadlock forever.
+		// Learned this the hard way — original version of this test
+		// hung on cycle 1 for exactly this reason.
+		//
+		// Use NtDelayExecution directly: it's a bare kernel syscall
+		// that never touches Go's scheduler. Negative value = relative
+		// time in 100-ns units.
+		holdDelay := -int64(sleepDurationMs) * 10_000
+		procNtDelayExecution.Call(0, uintptr(unsafe.Pointer(&holdDelay)))
 
 		// Resume each. Drain to zero using the same pattern as apc.Sleep.
 		for _, e := range suspended {
