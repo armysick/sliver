@@ -369,55 +369,75 @@ func suspendImagePeers(currentTID uint32, imageBase, imageEnd uintptr) ([]uint32
 // the thread stuck. Draining until ResumeThread returns 1 (was last
 // suspension) or 0 (wasn't suspended) fixes that.
 //
-// A failure to open a TID handle is intentionally swallowed — it means
-// the thread has exited between the suspend pass and now, so there is
-// nothing to resume. We must keep going through the rest of the list
-// unconditionally.
-//
 // The `cycle` argument is only used for debug probes; passing 0 is fine
 // when the caller doesn't have a cycle number to report.
+//
+// DIAGNOSTIC MODE: this build logs every case that isn't "single Resume
+// call returned 1" — including openThread failures, ResumeThread
+// returning -1 (error), and any drain that took more than one iteration.
+// Previous silent-break logic was hiding the actual failure mode: on the
+// last run, four peer Ms (including Go's netpoller) ended up permanently
+// suspended with no drain messages, which is only possible if
+// ResumeThread was returning -1 on the very first call and the drain
+// loop broke without logging.
 func resumePeers(cycle uint64, tids []uint32) {
-	openFail := 0
-	extraDrainsTotal := 0
-	capHits := 0
+	// Log the TID list so we can correlate leaks against specific peers.
+	dbg("cycle=%d resume begin tids=%v", cycle, tids)
+
+	failures := 0
 	for _, tid := range tids {
 		hThread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, tid)
 		if err != nil {
-			openFail++
-			dbg("cycle=%d resume OpenThread failed tid=%d err=%v", cycle, tid, err)
+			failures++
+			dbg("cycle=%d tid=%d OPEN_FAIL err=%v", cycle, tid, err)
 			continue
 		}
-		var drains int
+
+		// Drain the suspend count. We track the sequence of return values
+		// so if we break early we can report EXACTLY why.
 		var lastR uintptr
-		for drains = 0; drains < maxResumeDrain; drains++ {
-			r, _, _ := procResumeThread.Call(uintptr(hThread))
+		var lastErr error
+		drainCalls := 0
+		for i := 0; i < maxResumeDrain; i++ {
+			r, _, callErr := procResumeThread.Call(uintptr(hThread))
+			drainCalls++
 			lastR = r
-			if r == 0 || r == 1 || r == dwordMinusOne {
+			lastErr = callErr
+			if r == 0 {
+				// Was not suspended when we called Resume.
 				break
 			}
+			if r == 1 {
+				// Was suspended exactly once; now fully resumed.
+				break
+			}
+			if r == dwordMinusOne {
+				// ResumeThread FAILED. This is the silent path that was
+				// hiding leaks in prior builds.
+				failures++
+				dbg("cycle=%d tid=%d RESUME_FAIL r=-1 err=%v drainCalls=%d",
+					cycle, tid, callErr, drainCalls)
+				break
+			}
+			// r > 1: still suspended, keep draining.
 		}
-		if drains > 1 {
-			// This is the diagnostic we most want. lastR is the previous
-			// count at the LAST Resume call — if drains hit the cap and
-			// lastR > 1, the thread is likely still suspended and we
-			// are the "cannot drain" case that produces the hang.
-			dbg("cycle=%d tid=%d drained=%d lastR=%d%s",
-				cycle, tid, drains, lastR,
-				func() string {
-					if drains == maxResumeDrain && lastR > 1 {
-						capHits++
-						return " CAP_HIT_STILL_SUSPENDED"
-					}
-					return ""
-				}(),
-			)
-			extraDrainsTotal += drains - 1
+
+		// Log any non-trivial drain (2+ Resume calls) or a cap hit.
+		if drainCalls >= 2 {
+			tag := ""
+			if drainCalls == maxResumeDrain && lastR > 1 && lastR != dwordMinusOne {
+				tag = " CAP_HIT_STILL_SUSPENDED"
+				failures++
+			}
+			dbg("cycle=%d tid=%d DRAIN calls=%d lastR=%d lastErr=%v%s",
+				cycle, tid, drainCalls, lastR, lastErr, tag)
 		}
+
 		windows.CloseHandle(hThread)
 	}
-	if openFail > 0 || extraDrainsTotal > 0 || capHits > 0 {
-		dbg("cycle=%d resume summary: openFail=%d extraDrainsTotal=%d capHits=%d",
-			cycle, openFail, extraDrainsTotal, capHits)
+
+	if failures > 0 {
+		dbg("cycle=%d resume end failures=%d (peers may still be suspended)", cycle, failures)
 	}
 }
 
