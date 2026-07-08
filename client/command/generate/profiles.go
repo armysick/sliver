@@ -321,7 +321,7 @@ func PrintProfileInfo(name string, con *console.SliverClient) {
 		properties["sgn"],
 	})
 	tw.AppendRow(table.Row{
-		"Sleep obfuscation (Ekko) is",
+		"Sleep obfuscation is",
 		properties["sleepobf"],
 	})
 

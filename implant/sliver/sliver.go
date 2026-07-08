@@ -302,7 +302,7 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 	time.Sleep(time.Second)
 	beacon.Close()
 
-	// BeaconMain - Is executed in it's own goroutine as the function will block
+	// BeaconMain - Is executed in its own goroutine as the function will block
 	// until all tasks complete (in success or failure), if a task handler blocks
 	// forever it will simply block this set of tasks instead of the entire beacon
 	errors := make(chan error)
@@ -345,7 +345,6 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 			// check if there's still time to sleep
 			timeUntilNextCheckIn := time.Until(nextCheckin)
 			if timeUntilNextCheckIn.Seconds() > 1 {
-				_ = 0
 				apc.Sleep(uint64(timeUntilNextCheckIn.Milliseconds()))
 			}
 		// {{else}}
