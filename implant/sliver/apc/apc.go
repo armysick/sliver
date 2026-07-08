@@ -137,6 +137,7 @@ var (
 	procVirtualAlloc     = kernel32.NewProc("VirtualAlloc")
 	procVirtualFree      = kernel32.NewProc("VirtualFree")
 	procVirtualProtect   = kernel32.NewProc("VirtualProtect")
+	procVirtualQuery     = kernel32.NewProc("VirtualQuery")
 	procQueueUserAPC     = kernel32.NewProc("QueueUserAPC")
 	procSuspendThread    = kernel32.NewProc("SuspendThread")
 	procResumeThread     = kernel32.NewProc("ResumeThread")
@@ -189,6 +190,40 @@ func dbg(format string, args ...any) {
 	}
 	procOutputDebugStringA.Call(uintptr(unsafe.Pointer(p)))
 	runtime.KeepAlive(p)
+}
+
+// ponytail: temporary diagnostic. probeMem calls VirtualQuery on addr and
+// dbg-logs the region base/size/state/protect. Used to reconcile the
+// observed Process Hacker states with what the trampoline should produce.
+// Remove once the memory-state mystery is resolved.
+type memBasicInfo struct {
+	BaseAddress       uintptr
+	AllocationBase    uintptr
+	AllocationProtect uint32
+	_pad1             uint32
+	RegionSize        uintptr
+	State             uint32
+	Protect           uint32
+	Type              uint32
+	_pad2             uint32
+}
+
+func probeMem(label string, addr uintptr) {
+	if !apcDebug {
+		return
+	}
+	var mbi memBasicInfo
+	ret, _, _ := procVirtualQuery.Call(
+		addr,
+		uintptr(unsafe.Pointer(&mbi)),
+		unsafe.Sizeof(mbi),
+	)
+	if ret == 0 {
+		dbg("probe %s addr=0x%x VirtualQuery=0", label, addr)
+		return
+	}
+	dbg("probe %s addr=0x%x base=0x%x size=0x%x state=0x%x protect=0x%x type=0x%x",
+		label, addr, mbi.BaseAddress, mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type)
 }
 
 // ustring matches the informal SystemFunction032 argument type
@@ -379,7 +414,7 @@ func init() {
 	// produced a silent 2-second crash on the first sleep cycle.
 	for _, p := range []*syscall.LazyProc{
 		procGetModuleHandleA, procVirtualAlloc, procVirtualFree,
-		procVirtualProtect, procQueueUserAPC, procSuspendThread, procResumeThread,
+		procVirtualProtect, procVirtualQuery, procQueueUserAPC, procSuspendThread, procResumeThread,
 		procOutputDebugStringA,
 		procCreateTimerQueueTimer, procDeleteTimerQueueTimer,
 		procNtDelayExecution, procNtWaitForSingleObject, procNtQueryInformationThread,
@@ -1019,6 +1054,8 @@ func Sleep(sleepMs uint64) error {
 		return errors.New("apc: QueueUserAPC failed")
 	}
 	dbg("cycle=%d entering alertable wait", cycle)
+	probeMem("pre-wait image", imageBase)
+	probeMem("pre-wait .text", textSectionBase)
 
 	// Enter the alertable wait. The kernel notices the queued APC,
 	// dispatches the trampoline (which runs the whole encrypt/sleep/
@@ -1037,6 +1074,8 @@ func Sleep(sleepMs uint64) error {
 	)
 
 	dbg("cycle=%d alertable wait returned", cycle)
+	probeMem("post-wait image", imageBase)
+	probeMem("post-wait .text", textSectionBase)
 
 	// -------- RESUME PEERS + CLOSE HANDLES --------
 	// Image is decrypted and executable again; peers are safe to run.
