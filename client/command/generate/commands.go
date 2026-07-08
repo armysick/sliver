@@ -307,7 +307,6 @@ func coreImplantFlags(name string, cmd *cobra.Command) {
 		f.BoolP("evasion", "e", false, "enable evasion features (e.g. overwrite user space hooks)")
 		f.BoolP("skip-symbols", "l", false, "skip symbol obfuscation")
 		f.BoolP("disable-sgn", "G", false, "disable shikata ga nai shellcode encoder")
-		f.BoolP("sleep-obfuscation", "B", false, "apply ekko in-memory sleep obfuscation")
 
 		f.StringP("canary", "c", "", "canary domain(s)")
 
@@ -365,6 +364,7 @@ func coreBeaconFlags(name string, cmd *cobra.Command) {
 		f.Int64P("minutes", "M", 0, "beacon interval minutes")
 		f.Int64P("seconds", "S", 60, "beacon interval seconds")
 		f.Int64P("jitter", "J", 30, "beacon interval jitter in seconds")
+		f.BoolP("sleep-obfuscation", "B", false, "apply in-memory sleep obfuscation (Windows only)")
 	})
 }
 
