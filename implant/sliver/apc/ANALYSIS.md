@@ -366,41 +366,32 @@ what makes the whole design possible.
 
 ## TODO — future work
 
-### 1. Test APC without leaving `.text` as RWX
+### 1. Full per-section protection restore
 
-The current trampoline restores the image's protection to
-`PAGE_EXECUTE_READWRITE` (0x40) at the end of every cycle. This
-matches upstream Ekko and is the *simplest* thing that works — a
-single VirtualProtect over the whole `SizeOfImage` region — but RWX
-memory is a loud IOC. Memory scanners (Defender AMSI callbacks,
-Elastic, Sysmon, PE-sieve, moneta, HollowsHunter…) flag it
-immediately.
+The trampoline currently restores only `.text` to `PAGE_EXECUTE_READ`
+at the end of each cycle. `.rdata` and `.data` (and everything else
+past `.text`) are left as `PAGE_READWRITE` — the state they were
+temporarily raised to for the encryption pass. There is no RWX
+anywhere in the image, which is the primary OPSEC goal, but `.rdata`
+being writable in between cycles is a smaller signal that a
+suspicious scanner could still pick up.
 
-The right thing is to restore each section to its original
-protection: `.text` → `PAGE_EXECUTE_READ` (RX), `.rdata` →
-`PAGE_READONLY`, `.data` → `PAGE_READWRITE`. That means:
+The complete fix walks the section headers at init, captures each
+section's `(VirtualAddress, VirtualSize, Characteristics)`, and
+during decrypt restores each section to its original protection
+derived from `Characteristics` bits (`IMAGE_SCN_MEM_READ` / `_WRITE`
+/ `_EXECUTE`).
 
-- At package init or first-Sleep, walk the section headers, capture
-  each section's `(VirtualAddress, VirtualSize, Characteristics)`.
-- Encrypt path: `VirtualProtect` each section to `PAGE_READWRITE`
-  (or `PAGE_EXECUTE_READWRITE` if we want to be lazy on `.text`).
-- Decrypt path: `VirtualProtect` each section back to its *original*
-  protection derived from `Characteristics` bits (`IMAGE_SCN_MEM_READ`
-  / `_WRITE` / `_EXECUTE`).
+Complication: the trampoline is a single hand-encoded x64 blob with
+hard-coded offsets. Iterating over N sections means either a loop
+in the machine code or N unrolled `VirtualProtect` calls. Probably
+cleaner to precompute a small array of `{addr, size, encProt,
+decProt}` tuples in Go and iterate it in a tight ASM loop.
 
-Complication: the current trampoline is a single hand-encoded x64
-blob with hard-coded offsets into `apcArgs`. Iterating over N
-sections means the trampoline needs a loop, or we unroll it into N
-`VirtualProtect` calls per phase — either grows the machine code
-substantially. Probably cleaner to precompute a small array of
-`{addr, size, encProt, decProt}` tuples in Go and have the
-trampoline iterate it in a tight ASM loop.
-
-Verification: after landing this, run `moneta -pid <beacon>` while
-the beacon is idle. Should show `.text` as `RX`, no `RWX` regions
-inside the image mapping. The RWX region for the trampoline itself
-will still show up but it's a fixed 96 bytes outside the image and
-much less signature-worthy.
+Verification: `moneta -pid <beacon>` while idle should show `.text`
+as `RX`, `.rdata` as `R`, `.data` as `RW`, and no `RWX` anywhere in
+the image mapping. The 96-byte trampoline RWX region outside the
+image will still show up but is far less signature-worthy.
 
 ### 2. Backport the watchdog to the Ekko branch — YOLO
 
