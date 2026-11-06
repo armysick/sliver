@@ -18,7 +18,9 @@ type M128A struct {
 // its VectorRegister landed at offset 256 and every later field was
 // shifted. It happened to work because the chain only sets fields below
 // offset 256 and the garbage XMM values went into registers the chain
-// never relies on — but GetThreadContext would have overflowed it.)
+// never relies on — and GetThreadContext was only ever called with
+// CONTEXT_CONTROL, which writes nothing past offset 256. A full-context
+// read would have overflowed the 720-byte struct.)
 type CONTEXT struct {
 	P1Home               uint64
 	P2Home               uint64
