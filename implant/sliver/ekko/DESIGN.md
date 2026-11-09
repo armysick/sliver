@@ -86,10 +86,21 @@ for i := 0; i < maxResumeDrain; i++ {
 
 Two problems, one shared with `apc.go` (INVESTIGATION §5.1):
 
-- The drain drives counts to zero even when the count belongs to *Go's
-  own* `preemptM` pair (sysmon suspended a thread, has not yet done
-  Get/SetThreadContext). The thread then runs while sysmon operates on
-  its context — rare context corruption, then a crash.
+- The drain drives counts to zero even when the count belongs to Go's own
+  async-preemption sequence. Since Go 1.14 on Windows, sysmon's `retake`
+  → `preemptone` (proc.go:6942) sets the cooperative flag
+  (`gp.preempt`, `stackguard0 = stackPreempt`) *and* calls `preemptM`,
+  which holds the target thread suspended across
+  `SuspendThread → GetThreadContext → SetThreadContext → ResumeThread`
+  under `suspendLock` (os_windows.go:1179-1263). A concurrent
+  `ResumeThread` from the drain lands inside that window: the thread
+  starts running while `preemptM` is still about to patch its context —
+  rare context corruption, then a crash. (Note the runtime releases
+  `suspendLock` right after `GetThreadContext`, before the
+  `SetThreadContext` — nothing else is allowed to touch the suspend
+  count in that window.) This interleaving is an unobserved candidate
+  (INVESTIGATION candidate 2d); the *observed* reason to delete the
+  drain is simply the next bullet.
 - The whole resume loop is Go code, so it is itself subject to the
   mechanism-#1 deadlock above.
 
