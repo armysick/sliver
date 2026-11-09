@@ -44,6 +44,7 @@ type CONTEXT struct {
 	R14                  uint64
 	R15                  uint64
 	Rip                  uint64
+	FltSave              [512]byte // XMM_SAVE_AREA32: without it CONTEXT is 720 bytes instead of Windows' 1232
 	VectorRegister       [26]M128A
 	VectorControl        uint64
 	DebugControl         uint64
